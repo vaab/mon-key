@@ -147,17 +147,6 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Pull pending stdin events without blocking
         self.ingest();
-        // Finalize the current sequence if we've gone past the gap without new input
-        if self.cur.is_some() {
-            if let Some(last) = self.last_event {
-                if last.elapsed() >= Duration::from_millis(self.gap_ms) {
-                    self.prev = self.cur.take();
-                    self.last_event = None;
-                }
-            }
-        }
-        // Pull pending stdin events without blocking
-        self.ingest();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("keyd live graph");
             ui.label(format!("Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.", self.gap_ms));
@@ -167,12 +156,19 @@ impl eframe::App for AppState {
             let (resp, painter) = ui.allocate_painter(available, egui::Sense::hover());
             let rect = resp.rect;
 
-            // Recording indicator (red dot in top-right while within gap window)
-            let recording = self.cur.is_some()
-                && self
+            // --- finalize current sequence by independent timer ---
+            let elapsed_ok = self
                 .last_event
-                .map(|t| t.elapsed() < Duration::from_millis(self.gap_ms))
+                .map(|t| t.elapsed() >= Duration::from_millis(self.gap_ms))
                 .unwrap_or(false);
+            let has_holds = self.cur.as_ref().map(|s| !s.holds.is_empty()).unwrap_or(false);
+            if self.cur.is_some() && elapsed_ok && !has_holds {
+                // time gap reached AND no keys are held -> finalize
+                self.prev = self.cur.take();
+            }
+
+            // Recording indicator (red dot while active recording window or keys held)
+            let recording = self.cur.is_some() && (!elapsed_ok || has_holds);
             if recording {
                 let r = 7.0;
                 let center = Pos2::new(rect.right() - 12.0, rect.top() + 12.0);
