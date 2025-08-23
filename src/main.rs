@@ -137,13 +137,23 @@ impl AppState {
 // ---------------- UI -----------------
 use eframe::{egui, egui::{Color32, Pos2, Rect, Stroke}};
 
+// Choose a “nice” tick step (1/2/5×10^n) for the time axis
+fn nice_step(raw: f32) -> f32 {
+    let raw = raw.max(1.0);
+    let exp = raw.log10().floor();
+    let base = 10f32.powf(exp);
+    let m = raw / base;
+    let nice = if m <= 1.0 { 1.0 } else if m <= 2.0 { 2.0 } else if m <= 5.0 { 5.0 } else { 10.0 };
+    nice * base
+}
+
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Pull pending stdin events without blocking
         self.ingest();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("keyd live graph");
-            ui.label("Sequences split on ≥ 1000 ms gaps. Thick line = hold, dot = tap.");
+            ui.label(format!("Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.", self.gap_ms));
             ui.separator();
 
             let available = ui.available_size_before_wrap();
@@ -155,7 +165,7 @@ impl eframe::App for AppState {
             if let Some(s) = seq {
                 let left_gutter = 110.0; // space for labels
                 let right_pad = 10.0;
-                let top_pad = 10.0;
+                let top_pad = 22.0;
                 let row_h = 28.0;
                 let line_thick = 10.0;
                 let dot_r = 6.0;
@@ -168,14 +178,37 @@ impl eframe::App for AppState {
                 let x1 = rect.right() - right_pad;
                 let y0 = rect.top() + top_pad;
 
-                // grid line at each 100 ms
-                let step_ms = 100.0_f32;
-                let mut ms = 0.0_f32;
-                while ms <= tmax {
+                // time grid + tick labels
+                // Choose tick step based on available width and estimated label width
+                let label_font = egui::FontId::proportional(12.0);
+                let max_label_text = format!("{:.0} ms", tmax.round());
+                let est_label_px: f32 = ctx.fonts(|f| {
+                    let galley = f.layout_no_wrap(max_label_text, label_font.clone(), Color32::WHITE);
+                    galley.size().x
+                });
+                let min_px = est_label_px + 16.0; // label width + spacing
+                let plot_w = (x1 - x0).max(1.0);
+                let mut step_ms = nice_step(tmax / 8.0);
+                loop {
+                    let dx = (step_ms / tmax) * plot_w;
+                    if dx >= min_px { break; }
+                    let next = nice_step(step_ms * 1.5);
+                    if (next - step_ms).abs() < f32::EPSILON { break; }
+                    step_ms = next;
+                }
+                let mut ms = 0.0f32;
+                while ms <= tmax + 0.0001 {
                     let x = x0 + (ms / tmax) * (x1 - x0);
                     painter.line_segment(
                         [Pos2::new(x, y0), Pos2::new(x, y0 + rows * row_h)],
                         Stroke::new(1.0, Color32::from_gray(60)),
+                    );
+                    painter.text(
+                        Pos2::new(x, y0 - 6.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("{:.0} ms", ms.round()),
+                        label_font.clone(),
+                        Color32::GRAY,
                     );
                     ms += step_ms;
                 }
@@ -247,14 +280,24 @@ impl eframe::App for AppState {
 }
 
 fn main() -> Result<()> {
-    let rx = stdin_reader(1000);
+    // Parse --gap-ms <u64> from CLI
+    let mut gap_ms: u64 = 1000;
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--gap-ms" | "-g" => {
+                if let Some(v) = args.next() { if let Ok(n) = v.parse() { gap_ms = n; } }
+            }
+            _ => {}
+        }
+    }
+
+    let rx = stdin_reader(gap_ms);
     let native_options = eframe::NativeOptions::default();
-    let app = AppState::new(rx, 1000);
+    let app = AppState::new(rx, gap_ms);
     eframe::run_native(
         "keyd live graph",
         native_options,
         Box::new(|_| Box::new(app)),
     ).map_err(|e| anyhow!("eframe error: {e}"))
 }
-
-
