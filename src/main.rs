@@ -148,7 +148,28 @@ impl eframe::App for AppState {
         // Pull pending stdin events without blocking
         self.ingest();
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.heading("keyd live graph");
+            // finalize (timer) before drawing header
+            let elapsed_ok = self
+                .last_event
+                .map(|t| t.elapsed() >= Duration::from_millis(self.gap_ms))
+                .unwrap_or(false);
+            let has_holds = self.cur.as_ref().map(|s| !s.holds.is_empty()).unwrap_or(false);
+            if self.cur.is_some() && elapsed_ok && !has_holds {
+                self.prev = self.cur.take();
+            }
+
+            // Header row: left-aligned title + red dot at far right
+            ui.horizontal(|ui| {
+                ui.heading("keyd live graph");
+                let recording = self.cur.is_some() && (!elapsed_ok || has_holds);
+                let dot_w = 14.0f32;
+                let space = (ui.available_width() - dot_w).max(0.0);
+                if space > 0.0 { ui.add_space(space); }
+                if recording {
+                    let (resp, rp) = ui.allocate_painter(egui::vec2(dot_w, dot_w), egui::Sense::hover());
+                    rp.circle_filled(resp.rect.center(), 6.0, Color32::from_rgb(220, 50, 50));
+                }
+            });
             ui.label(format!("Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.", self.gap_ms));
             ui.separator();
 
@@ -156,24 +177,7 @@ impl eframe::App for AppState {
             let (resp, painter) = ui.allocate_painter(available, egui::Sense::hover());
             let rect = resp.rect;
 
-            // --- finalize current sequence by independent timer ---
-            let elapsed_ok = self
-                .last_event
-                .map(|t| t.elapsed() >= Duration::from_millis(self.gap_ms))
-                .unwrap_or(false);
-            let has_holds = self.cur.as_ref().map(|s| !s.holds.is_empty()).unwrap_or(false);
-            if self.cur.is_some() && elapsed_ok && !has_holds {
-                // time gap reached AND no keys are held -> finalize
-                self.prev = self.cur.take();
-            }
-
-            // Recording indicator (red dot while active recording window or keys held)
-            let recording = self.cur.is_some() && (!elapsed_ok || has_holds);
-            if recording {
-                let r = 7.0;
-                let center = Pos2::new(rect.right() - 12.0, rect.top() + 12.0);
-                painter.circle_filled(center, r, Color32::from_rgb(220, 50, 50));
-            }
+            // (finalize moved earlier before header)
 
             // Choose which sequence to draw: live (cur) if present, else previous (prev)
             let seq = if self.cur.is_some() { self.cur.as_ref() } else { self.prev.as_ref() };
@@ -287,14 +291,6 @@ impl eframe::App for AppState {
                     painter.circle_filled(Pos2::new(to_x(tap.at), y), dot_r, Color32::from_rgb(255, 210, 100));
                 }
 
-                // time legend
-                painter.text(
-                    Pos2::new(x0, rect.bottom() - 18.0),
-                    egui::Align2::LEFT_CENTER,
-                    format!("0 ms … {} ms", s.now_ms),
-                    egui::FontId::proportional(14.0),
-                    Color32::GRAY,
-                );
             } else {
                 painter.text(
                     rect.center(),
