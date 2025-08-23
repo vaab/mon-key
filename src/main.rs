@@ -251,9 +251,23 @@ impl eframe::App for AppState {
                 for seg in &s.segments {
                     let row = s.row_index[&seg.key];
                     let y = y0 + row as f32 * row_h + row_h * 0.5;
+                    let x_start = to_x(seg.start);
+                    let x_end = to_x(seg.end);
+                    // draw the hold bar
                     painter.line_segment(
-                        [Pos2::new(to_x(seg.start), y), Pos2::new(to_x(seg.end), y)],
+                        [Pos2::new(x_start, y), Pos2::new(x_end, y)],
                         Stroke::new(line_thick, Color32::from_rgb(90, 170, 255)),
+                    );
+                    // duration label centered above the segment (smaller and closer)
+                    let mid_x = (x_start + x_end) * 0.5;
+                    let dur = seg.end.saturating_sub(seg.start);
+                    let label_y = y - (line_thick * 0.5) - 1.0; // tuck just above the bar
+                    painter.text(
+                        Pos2::new(mid_x, label_y),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("{} ms", dur),
+                        egui::FontId::proportional(10.0),
+                        Color32::LIGHT_GRAY,
                     );
                 }
                 // active holds (draw to now)
