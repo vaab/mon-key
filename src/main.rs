@@ -1,8 +1,9 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::thread;
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind { Down, Up }
@@ -79,7 +80,7 @@ impl Sequence {
     }
 }
 
-fn stdin_reader(rx_gap_ms: u64) -> Receiver<Event> {
+fn stdin_reader(_rx_gap_ms: u64) -> Receiver<Event> {
     let (tx, rx) = unbounded();
     thread::spawn(move || {
         let stdin = std::io::stdin();
@@ -102,34 +103,29 @@ struct AppState {
     gap_ms: u64,
     prev: Option<Sequence>,
     cur: Option<Sequence>,
+    last_event: Option<Instant>,
 }
 
 impl AppState {
-    fn new(rx: Receiver<Event>, gap_ms: u64) -> Self { Self { rx, gap_ms, prev: None, cur: None } }
+    fn new(rx: Receiver<Event>, gap_ms: u64) -> Self {
+        Self { rx, gap_ms, prev: None, cur: None, last_event: None }
+    }
     fn ingest(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match &mut self.cur {
                 None => {
                     let mut s = Sequence::new();
-                    s.now_ms = 0;
-                    // first event starts at t=0
+                    s.now_ms = 0; // first event in a fresh sequence starts at 0
                     match ev.kind { Kind::Down => s.on_down(&ev.key), Kind::Up => s.on_up(&ev.key) }
                     self.cur = Some(s);
                 }
                 Some(s) => {
-                    if ev.delta_ms >= self.gap_ms {
-                        // finalize current -> prev, start new sequence
-                        self.prev = self.cur.take();
-                        let mut s2 = Sequence::new();
-                        s2.now_ms = 0; // reset time for new burst
-                        match ev.kind { Kind::Down => s2.on_down(&ev.key), Kind::Up => s2.on_up(&ev.key) }
-                        self.cur = Some(s2);
-                    } else {
-                        s.now_ms = s.now_ms.saturating_add(ev.delta_ms);
-                        match ev.kind { Kind::Down => s.on_down(&ev.key), Kind::Up => s.on_up(&ev.key) }
-                    }
+                    s.now_ms = s.now_ms.saturating_add(ev.delta_ms);
+                    match ev.kind { Kind::Down => s.on_down(&ev.key), Kind::Up => s.on_up(&ev.key) }
                 }
             }
+            // independent timer anchor for recording / auto-finalize
+            self.last_event = Some(Instant::now());
         }
     }
 }
@@ -151,6 +147,17 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Pull pending stdin events without blocking
         self.ingest();
+        // Finalize the current sequence if we've gone past the gap without new input
+        if self.cur.is_some() {
+            if let Some(last) = self.last_event {
+                if last.elapsed() >= Duration::from_millis(self.gap_ms) {
+                    self.prev = self.cur.take();
+                    self.last_event = None;
+                }
+            }
+        }
+        // Pull pending stdin events without blocking
+        self.ingest();
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("keyd live graph");
             ui.label(format!("Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.", self.gap_ms));
@@ -159,6 +166,18 @@ impl eframe::App for AppState {
             let available = ui.available_size_before_wrap();
             let (resp, painter) = ui.allocate_painter(available, egui::Sense::hover());
             let rect = resp.rect;
+
+            // Recording indicator (red dot in top-right while within gap window)
+            let recording = self.cur.is_some()
+                && self
+                .last_event
+                .map(|t| t.elapsed() < Duration::from_millis(self.gap_ms))
+                .unwrap_or(false);
+            if recording {
+                let r = 7.0;
+                let center = Pos2::new(rect.right() - 12.0, rect.top() + 12.0);
+                painter.circle_filled(center, r, Color32::from_rgb(220, 50, 50));
+            }
 
             // Choose which sequence to draw: live (cur) if present, else previous (prev)
             let seq = if self.cur.is_some() { self.cur.as_ref() } else { self.prev.as_ref() };
