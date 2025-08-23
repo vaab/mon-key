@@ -72,11 +72,10 @@ impl Sequence {
             // Up without known down: treat as tap at now
             self.taps.push(Tap { key: key.to_string(), at: self.now_ms });
         }
-    }
-    fn t_max(&self) -> u64 {
-        let mut t = self.now_ms;
-        for (_, &s) in &self.holds { if s > t { t = s; } }
-        t
+        if self.holds.is_empty() {
+            // Start idle from the key that just ended
+            self.idle_start = Some((self.now_ms, key.to_string()));
+        }
     }
 }
 
@@ -104,12 +103,14 @@ struct AppState {
     prev: Option<Sequence>,
     cur: Option<Sequence>,
     last_event: Option<Instant>,
+    anim_scale: Option<ScaleAnim>,
 }
 
 impl AppState {
     fn new(rx: Receiver<Event>, gap_ms: u64) -> Self {
-        Self { rx, gap_ms, prev: None, cur: None, last_event: None }
+        Self { rx, gap_ms, prev: None, cur: None, last_event: None, anim_scale: None }
     }
+
     fn ingest(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
             match &mut self.cur {
@@ -143,6 +144,11 @@ fn nice_step(raw: f32) -> f32 {
     nice * base
 }
 
+#[derive(Clone)]
+struct ScaleAnim { start: Instant, from: f32, to: f32, dur_ms: u64 }
+fn lerp(a: f32, b: f32, t: f32) -> f32 { a + (b - a) * t }
+fn smoothstep(t: f32) -> f32 { let t = t.clamp(0.0, 1.0); t * t * (3.0 - 2.0 * t) }
+
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Pull pending stdin events without blocking
@@ -155,6 +161,13 @@ impl eframe::App for AppState {
                 .unwrap_or(false);
             let has_holds = self.cur.as_ref().map(|s| !s.holds.is_empty()).unwrap_or(false);
             if self.cur.is_some() && elapsed_ok && !has_holds {
+                // Start scale-shrink animation from current visual time to final time
+                if let Some(sref) = self.cur.as_ref() {
+                    let vis_elapsed = self.last_event.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                    let from = (sref.now_ms.saturating_add(vis_elapsed)).max(1) as f32;
+                    let to = (sref.now_ms.max(1)) as f32;
+                    self.anim_scale = Some(ScaleAnim { start: Instant::now(), from, to, dur_ms: 220 });
+                }
                 self.prev = self.cur.take();
             }
 
@@ -199,8 +212,23 @@ impl eframe::App for AppState {
 
                 let rows = s.row_order.len().max(1) as f32;
 
-                // Axis mapping
-                let tmax = s.t_max().max(1) as f32;
+                // Axis mapping (visual time grows between events; smooth shrink after finalize)
+                let is_live = self.cur.is_some();
+                let vis_elapsed_ms: u64 = if is_live {
+                    self.last_event.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0)
+                } else { 0 };
+                let now_vis_ms = s.now_ms.saturating_add(vis_elapsed_ms);
+                let mut tmax = (now_vis_ms.max(1)) as f32;
+                // If we are showing the previous (finalized) sequence, animate tmax down to final
+                if self.cur.is_none() {
+                    if let Some(anim) = &self.anim_scale {
+                        let a = (anim.start.elapsed().as_millis() as f32 / anim.dur_ms as f32).clamp(0.0, 1.0);
+                        tmax = lerp(anim.from, anim.to, smoothstep(a));
+                        if a >= 1.0 { self.anim_scale = None; }
+                    } else {
+                        tmax = (s.now_ms.max(1)) as f32;
+                    }
+                }
                 let x0 = rect.left() + left_gutter;
                 let x1 = rect.right() - right_pad;
                 let y0 = rect.top() + top_pad;
@@ -283,13 +311,14 @@ impl eframe::App for AppState {
                         Color32::LIGHT_GRAY,
                     );
                 }
-                // active holds (draw to now)
+                // active holds (draw to visual now in white)
                 for (key, &start) in &s.holds {
                     let row = s.row_index[key];
                     let y = y0 + row as f32 * row_h + row_h * 0.5;
+                    let end_vis = now_vis_ms;
                     painter.line_segment(
-                        [Pos2::new(to_x(start), y), Pos2::new(to_x(s.now_ms), y)],
-                        Stroke::new(line_thick, Color32::from_rgb(90, 170, 255)),
+                        [Pos2::new(to_x(start), y), Pos2::new(to_x(end_vis), y)],
+                        Stroke::new(line_thick, Color32::WHITE),
                     );
                 }
                 // taps
