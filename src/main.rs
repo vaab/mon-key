@@ -228,12 +228,13 @@ impl eframe::App for AppState {
                     ms += step_ms;
                 }
 
-                // labels + baselines
+                // labels + baselines (right‑aligned to x0)
                 for (i, key) in s.row_order.iter().enumerate() {
                     let y = y0 + i as f32 * row_h + row_h * 0.5;
+                    let label_x = x0 - 20.0; // small padding from the plot area
                     painter.text(
-                        Pos2::new(rect.left() + 8.0, y - 8.0),
-                        egui::Align2::LEFT_TOP,
+                        Pos2::new(label_x, y),
+                        egui::Align2::RIGHT_CENTER,
                         key,
                         egui::FontId::proportional(14.0),
                         Color32::LIGHT_GRAY,
