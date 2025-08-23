@@ -182,7 +182,15 @@ impl eframe::App for AppState {
             // Choose which sequence to draw: live (cur) if present, else previous (prev)
             let seq = if self.cur.is_some() { self.cur.as_ref() } else { self.prev.as_ref() };
             if let Some(s) = seq {
-                let left_gutter = 110.0; // space for labels
+                // Dynamic gutter based on max key label width
+                let key_font = egui::FontId::proportional(14.0);
+                let max_key_label_px: f32 = ctx.fonts(|f| {
+                    s.row_order.iter().map(|k| {
+                        f.layout_no_wrap(k.clone(), key_font.clone(), Color32::WHITE).size().x
+                    }).fold(0.0, f32::max)
+                });
+                let label_pad = 20.0; // spacing between labels and plot
+                let left_gutter = (max_key_label_px + label_pad).max(30.0); // clamp to a reasonable minimum
                 let right_pad = 10.0;
                 let top_pad = 22.0;
                 let row_h = 28.0;
@@ -235,12 +243,12 @@ impl eframe::App for AppState {
                 // labels + baselines (right‑aligned to x0)
                 for (i, key) in s.row_order.iter().enumerate() {
                     let y = y0 + i as f32 * row_h + row_h * 0.5;
-                    let label_x = x0 - 20.0; // small padding from the plot area
+                    let label_x = x0 - label_pad; // use the same computed pad
                     painter.text(
                         Pos2::new(label_x, y),
                         egui::Align2::RIGHT_CENTER,
                         key,
-                        egui::FontId::proportional(14.0),
+                        key_font.clone(),
                         Color32::LIGHT_GRAY,
                     );
                     painter.line_segment(
