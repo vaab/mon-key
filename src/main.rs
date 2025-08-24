@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver};
-use eframe::{egui, egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Stroke, Key}};
+use eframe::{egui, egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Stroke, Key, CursorIcon}};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::thread;
@@ -846,9 +846,9 @@ impl eframe::App for AppState {
                 let gap_icon = 8.0_f32;       // ring ↔ right edge
                 let gap_text_icon = 0.0_f32;  // text ↔ ring
                 let hint_text = if self.listening {
-                    "press <Ins> to disable listening"
+                    "press <Ins> or click to disable listening"
                 } else {
-                    "press <Ins> to enable listening"
+                    "press <Ins> or click to enable listening"
                 };
                 let body_font = ui.style().text_styles.get(&egui::TextStyle::Body).cloned().unwrap_or(FontId::proportional(14.0));
                 let hint_w = ctx.fonts(|f| {
@@ -863,7 +863,7 @@ impl eframe::App for AppState {
                 ui.label(egui::RichText::new(hint_text).color(hint_col));
                 ui.add_space(gap_text_icon);
 
-                let (r_icon, p_icon) = ui.allocate_painter(egui::vec2(icon_sz, icon_sz), egui::Sense::hover());
+                let (r_icon, p_icon) = ui.allocate_painter(egui::vec2(icon_sz, icon_sz), egui::Sense::click());
                 let t = ctx.input(|i| i.time) as f32;
                 if ring_alpha > 0.001 {
                     draw_listening_ring(&p_icon, r_icon.rect, self.listening, t, ring_alpha);
@@ -875,6 +875,15 @@ impl eframe::App for AppState {
                     let a = (dot_alpha * 255.0).clamp(0.0, 255.0) as u8;
                     p_icon.circle_filled(r_icon.rect.center(), r, Color32::from_rgba_unmultiplied(220, 50, 50, a));
                 }
+                // Toggle listening when clicking the ring/dot
+                if r_icon.clicked() && !self.ui_edit_active {
+                    self.listening = !self.listening;
+                    if !self.listening {
+                        self.force_finalize_now();
+                    }
+                }
+                // Pointer hint
+                r_icon.on_hover_cursor(CursorIcon::PointingHand);
                 ui.add_space(right_pad_ui);
             });
             ui.horizontal(|ui| {
