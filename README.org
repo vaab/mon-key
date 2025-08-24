@@ -1,0 +1,91 @@
+#+TITLE: mon-key
+#+OPTIONS: toc:nil num:nil
+
+A small Rust/egui desktop viewer that turns the output of
+~keyd monitor -t~ into a live timeline. If you are trying to fine-tune some
+timings using [[https://github.com/rvaiya/keyd][keyd]] to get (for instance) the perfect [[https://precondition.github.io/home-row-mods][home-row mods]] setup
+to avoid false-positive, this might help you get an idea of why you
+get them, and what would be the ultimate values.
+
+https://github.com/user-attachments/assets/b81ab719-0c41-4296-a0f3-5dae49d8b679
+
+
+* Maturity
+
+This code is actually a vibe-coding toy experiment using [[https://chatgpt.com/][Chat GPT 5
+Thinking]]. I have NOT authored one line of this. I'm somewhat a
+beginner in [[https://www.rust-lang.org/][rust]], with a few handful of small project under my belt,
+but in this experiment, I tried to have very little attention to what
+was actually written. If it compiled, I moved to the next step.
+
+I still had to help here and there, and I was guiding the process step
+by step.
+
+Rust language strong typing and memory management guards ensures at
+least some degree of solidity in the end result, and ChatGPT 5
+Thinking was rarely breaking compilation. Although I had to manage
+numerous obvious mis-patched code.
+
+* Installation
+
+Clone the repository, then:
+
+#+begin_src bash
+cargo build --release
+#+end_src
+
+* Usage
+
+** Running the tool
+
+Input comes from =stdin=; no socket or file is required. The window is
+an egui/eframe X11 application.
+
+#+begin_src sh
+sudo keyd monitor -t | ./target/release/mon-key
+#+end_src
+
+** GUI interaction
+
+The app starts in listening mode, that you can toggle using ~<ins>~
+key or by clicking the top right rotating ring.
+
+*** In listening mode
+
+All key strokes captured/produceds by ~keyd~ are processed real time
+and collected in /recordings/. /recordings/ is a close sequence of
+keystrokes.
+
+Each recording will be stacked in the app window to let you visualize
+the timings of the pressing (down event) and the releasing (up event)
+of each keystrokes.
+
+The app will listen to all keystrokes except the ~<ins>~ key, used to
+stop the listening mode.
+
+*** Out of listening mode
+
+You can use:
+- Arrow keys to select the next/prior record
+- ~Del~ to delete the current selected record Note: you can also
+  delete a record by clicking on the small ~x~ on the top left of the
+  record.
+
+* Future Development
+
+I have several small ideas that I'll explore maybe:
+- plug directly to input controller to give more precise timings and
+  not depend on ~keyd~. Possibly comparing output of a ~keyd~
+  configured virtual keyboard with the actual keystrokes on the
+  keyboard.
+- persistent store in sqlite3 so we can collect readings.
+- grouping of readings
+- replaying possibility ?
+  The idea would be here to see if we can collect samples of problematic
+  reading for a home-row modifiers configuration, and see if we couldn't
+  be more clever about sorting false positive than just having a couple
+  timeout to tweak.
+
+* License
+
+[[file:LICENSE]]
