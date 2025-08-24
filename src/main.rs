@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Result};
 use crossbeam_channel::{unbounded, Receiver};
-use eframe::{egui, egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Stroke}};
+use eframe::{egui, egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Stroke, Key}};
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::thread;
@@ -41,7 +41,7 @@ fn parse_line(line: &str) -> Option<Event> {
     let state = parts.next()?.trim();
     let key = parts.next()?.trim().to_string();
 
-    // Filter out mouse/touchpad/pointer noise
+    // Filter out mouse/touchpad/pointer noise, and ignore Delete key from stdin
     let dev_l = device.to_ascii_lowercase();
     let key_l = key.to_ascii_lowercase();
     if dev_l.contains("mouse")
@@ -49,6 +49,8 @@ fn parse_line(line: &str) -> Option<Event> {
         || dev_l.contains("pointer")
         || key_l.contains("mouse")
         || key_l.starts_with("btn")
+        || key_l == "delete" // ignore Delete so UI handler owns it
+        || key_l == "del"
     {
         return None;
     }
@@ -506,7 +508,7 @@ fn draw_sequence_block(
     let key_font = FontId::proportional(14.0);
     let label_pad = 20.0;
     let sel_w = 5.0;      // selection bar width (reserved in gutter)
-    let sel_gap = 5.0;    // gap between selection bar and labels
+    let sel_gap = 4.0;    // gap between selection bar and labels
     let left_gutter = (measure_max_label_px(ctx, &key_font, &seq.row_order) + label_pad + sel_w + sel_gap).max(30.0);
     let right_pad = 10.0;
     let top_pad = 22.0;
@@ -578,6 +580,34 @@ impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ingest();
         self.finalize_if_idle_elapsed();
+
+        // Delete currently selected recording with Delete key (egui input, not stdin)
+        if ctx.input(|i| i.key_pressed(Key::Delete)) {
+            if let Some(sel) = self.selected_uid {
+                let mut removed = false;
+                if self.cur.as_ref().map_or(false, |s| s.uid == sel) {
+                    self.cur = None;
+                    removed = true;
+                } else if let Some(pos) = self.sequences.iter().position(|s| s.uid == sel) {
+                    self.sequences.remove(pos);
+                    removed = true;
+                }
+                if removed {
+                    if self.anim_target_uid == Some(sel) {
+                        self.anim_target_uid = None;
+                        self.anim_scale = None;
+                    }
+                    // Pick a new selection: live first, else most recent history, else none
+                    if let Some(s) = self.cur.as_ref() {
+                        self.selected_uid = Some(s.uid);
+                    } else if let Some(first) = self.sequences.first() {
+                        self.selected_uid = Some(first.uid);
+                    } else {
+                        self.selected_uid = None;
+                    }
+                }
+            }
+        }
 
         // If an animation finished, clear it
         if let Some(anim) = &self.anim_scale {
