@@ -35,6 +35,8 @@ fn parse_line(line: &str) -> Option<Event> {
 struct Segment { key: String, start: u64, end: u64 }
 #[derive(Default, Clone)]
 struct Tap { key: String, at: u64 }
+#[derive(Clone)]
+struct IdleGap { start: u64, end: u64, from_key: String, to_key: String }
 
 #[derive(Default, Clone)]
 struct Sequence {
@@ -48,6 +50,9 @@ struct Sequence {
     taps: Vec<Tap>,
     // Current time within sequence
     now_ms: u64,
+    // List of idle times
+    idles: Vec<IdleGap>,
+    idle_start: Option<(u64, String)>,
 }
 
 impl Sequence {
@@ -59,7 +64,14 @@ impl Sequence {
         self.row_index.insert(key.to_string(), i);
         i
     }
-    fn on_down(&mut self, key: &str) { self.ensure_row(key); self.holds.insert(key.to_string(), self.now_ms); }
+    fn on_down(&mut self, key: &str) {
+        // Close idle gap if one is open
+        if let Some((start, from_key)) = self.idle_start.take() {
+            self.idles.push(IdleGap { start, end: self.now_ms, from_key, to_key: key.to_string() });
+        }
+        self.ensure_row(key);
+        self.holds.insert(key.to_string(), self.now_ms);
+    }
     fn on_up(&mut self, key: &str) {
         self.ensure_row(key);
         if let Some(start) = self.holds.remove(key) {
@@ -85,7 +97,7 @@ fn stdin_reader(_rx_gap_ms: u64) -> Receiver<Event> {
         let stdin = std::io::stdin();
         for line in BufReader::new(stdin).lines() {
             match line { Ok(l) => {
-                if let Some(mut ev) = parse_line(&l) {
+                if let Some(ev) = parse_line(&l) {
                     // Accumulate deltas across lines until we emit the event to the UI; the UI
                     // will decide when to start a new sequence based on >= gap_ms.
                     // We pass the delta as-is; the UI state machine will interpret it.
@@ -327,6 +339,58 @@ impl eframe::App for AppState {
                     let row = s.row_index[&tap.key];
                     let y = y0 + row as f32 * row_h + row_h * 0.5;
                     painter.circle_filled(Pos2::new(to_x(tap.at), y), dot_r, Color32::from_rgb(255, 210, 100));
+                }
+
+                // idle gaps visualization (only completed gaps)
+                for idle in &s.idles {
+                    if idle.end <= idle.start { continue; }
+                    let xs = to_x(idle.start);
+                    let xe = to_x(idle.end);
+                    let row_s = s.row_index[&idle.from_key];
+                    let row_e = s.row_index[&idle.to_key];
+                    let ys = y0 + row_s as f32 * row_h + row_h * 0.5;
+                    let ye = y0 + row_e as f32 * row_h + row_h * 0.5;
+                    let thin = Stroke::new(1.0, Color32::from_rgba_unmultiplied(180,180,180,128));
+
+                    // choose arrow row: first below, else above, else same
+                    let arrow_row: usize = if row_s == row_e {
+                        row_s
+                    } else if row_e > row_s {
+                        (row_s + 1).min(s.row_order.len() - 1)
+                    } else {
+                        row_s.saturating_sub(1)
+                    };
+                    let y_arrow = y0 + arrow_row as f32 * row_h + row_h * 0.5;
+                    // vertical lines
+                    painter.line_segment([Pos2::new(xs, ys), Pos2::new(xs, y_arrow)], thin);
+                    painter.line_segment([Pos2::new(xe, ye), Pos2::new(xe, y_arrow)], thin);
+                    // horizontal double arrow (dotted)
+                    let dotted_col = Color32::from_rgba_unmultiplied(200,200,200,150);
+                    let step = 4.0; // px between dots
+                    let dot_r2 = 0.8;
+                    let mut x = xs;
+                    while x <= xe {
+                        painter.circle_filled(Pos2::new(x, y_arrow), dot_r2, dotted_col);
+                        x += step;
+                    }
+                    let ah = 5.0; // arrowhead half size
+                    // left arrow head
+                    painter.line_segment([Pos2::new(xs + ah, y_arrow - ah*0.6), Pos2::new(xs, y_arrow)], thin);
+                    painter.line_segment([Pos2::new(xs + ah, y_arrow + ah*0.6), Pos2::new(xs, y_arrow)], thin);
+                    // right arrow head
+                    painter.line_segment([Pos2::new(xe - ah, y_arrow - ah*0.6), Pos2::new(xe, y_arrow)], thin);
+                    painter.line_segment([Pos2::new(xe - ah, y_arrow + ah*0.6), Pos2::new(xe, y_arrow)], thin);
+
+                    // label at middle
+                    let mid_x = (xs + xe) * 0.5;
+                    let dur = (idle.end - idle.start) as u64;
+                    painter.text(
+                        Pos2::new(mid_x, y_arrow - 2.0),
+                        egui::Align2::CENTER_BOTTOM,
+                        format!("{} ms", dur),
+                        egui::FontId::proportional(10.0),
+                        Color32::from_rgba_unmultiplied(200,200,200,160),
+                    );
                 }
 
             } else {
