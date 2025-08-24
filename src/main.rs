@@ -247,8 +247,9 @@ impl AppState {
                         Kind::Down => s.on_down(&ev.key),
                         Kind::Up => s.on_up(&ev.key),
                     }
-                    // When a new recording starts, focus/select it
+                    // When a new recording starts, focus/select it & ensure it scrolls into view
                     self.selected_uid = Some(s.uid);
+                    self.scroll_selected_into_view = true;
                     self.cur = Some(s);
                 }
                 Some(s) => {
