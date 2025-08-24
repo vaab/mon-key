@@ -12,10 +12,10 @@ enum Kind { Down, Up }
 struct Event { delta_ms: u64, key: String, kind: Kind }
 
 fn parse_line(line: &str) -> Option<Event> {
-    // Expected: "+321 ms\t<device>\t<id>\t<key> <down|up>"
+    // Expected: "+321 ms   <device>    <id>    <key> <down|up>"
     let mut cols = line.split('\t');
     let delta_col = cols.next()?; // "+321 ms"
-    let _device = cols.next()?;   // device (unused)
+    let device = cols.next()?;   // device (used to filter mouse)
     let _id = cols.next()?;       // id (unused)
     let last = cols.next()?;      // "s down" or "leftmouse up"
 
@@ -27,6 +27,15 @@ fn parse_line(line: &str) -> Option<Event> {
     let mut parts = last.rsplitn(2, ' ');
     let state = parts.next()?.trim();
     let key = parts.next()?.trim().to_string();
+
+    // Ignore mouse/touchpad/pointer events
+    let dev_l = device.to_ascii_lowercase();
+    let key_l = key.to_ascii_lowercase();
+    if dev_l.contains("mouse") || dev_l.contains("touchpad") || dev_l.contains("pointer")
+        || key_l.contains("mouse") || key_l.starts_with("btn") {
+        return None;
+    }
+
     let kind = match state { "down" => Kind::Down, "up" => Kind::Up, _ => return None };
     Some(Event { delta_ms, key, kind })
 }
@@ -37,6 +46,7 @@ struct Segment { key: String, start: u64, end: u64 }
 struct Tap { key: String, at: u64 }
 #[derive(Clone)]
 struct IdleGap { start: u64, end: u64, from_key: String, to_key: String }
+
 
 #[derive(Default, Clone)]
 struct Sequence {
