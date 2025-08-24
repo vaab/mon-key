@@ -209,6 +209,7 @@ struct AppState {
     // indicator cross-fade state
     prev_recording: bool,
     ind_fade: Option<IndicatorFade>,
+    scroll_selected_into_view: bool,
 }
 
 impl AppState {
@@ -226,6 +227,7 @@ impl AppState {
             listening: true,
             prev_recording: false,
             ind_fade: None,
+            scroll_selected_into_view: false,
         }
     }
 
@@ -806,6 +808,33 @@ impl eframe::App for AppState {
             }
         };
 
+        // Arrow-key navigation when paused
+        if !self.listening {
+            if self.selected_uid.is_none() {
+                if let Some(first) = self.sequences.first() {
+                    self.selected_uid = Some(first.uid);
+                }
+            }
+            if let Some(sel) = self.selected_uid {
+                if ctx.input(|i| i.key_pressed(Key::ArrowDown)) {
+                    if let Some(idx) = self.sequences.iter().position(|s| s.uid == sel) {
+                        if idx + 1 < self.sequences.len() {
+                            self.selected_uid = Some(self.sequences[idx + 1].uid);
+                            self.scroll_selected_into_view = true;
+                        }
+                    }
+                }
+                if ctx.input(|i| i.key_pressed(Key::ArrowUp)) {
+                    if let Some(idx) = self.sequences.iter().position(|s| s.uid == sel) {
+                        if idx > 0 {
+                            self.selected_uid = Some(self.sequences[idx - 1].uid);
+                            self.scroll_selected_into_view = true;
+                        }
+                    }
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
 
             ui.horizontal(|ui| {
@@ -871,6 +900,10 @@ impl eframe::App for AppState {
                             let anim = if is_target { self.anim_scale.as_ref() } else { None };
                             let is_selected = self.selected_uid.map_or(false, |id| id == s.uid);
                             let resp = draw_sequence_block(ctx, ui, s, is_live, anim, self.last_event, is_selected);
+                            if is_selected && self.scroll_selected_into_view {
+                                resp.scroll_to_me(None);
+                                self.scroll_selected_into_view = false;
+                            }
                             if resp.clicked() {
                                 self.selected_uid = Some(s.uid);
                             }
