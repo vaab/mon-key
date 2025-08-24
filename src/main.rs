@@ -872,7 +872,7 @@ impl eframe::App for AppState {
                 ui.add_space(right_pad_ui);
             });
             ui.label(format!(
-                "Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.",
+                "Records split on ≥ {} ms gaps. Thick line = hold, dot = tap.",
                 self.gap_ms
             ));
             ui.separator();
