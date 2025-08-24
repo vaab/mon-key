@@ -655,12 +655,12 @@ fn draw_sequence_block(
     anim_scale: Option<&ScaleAnim>,
     last_event: Option<Instant>,
     selected: bool,
-) -> egui::Response {
+) -> (egui::Response, bool) {
     // ---- Metrics ----
     let key_font = FontId::proportional(14.0);
     let label_pad = 20.0;
     let sel_w = 5.0;      // selection bar width (reserved in gutter)
-    let sel_gap = 4.0;    // gap between selection bar and labels
+    let sel_gap = 10.0;    // gap between selection bar and labels
     let left_gutter = (measure_max_label_px(ctx, &key_font, &seq.row_order) + label_pad + sel_w + sel_gap).max(30.0);
     let right_pad = 10.0;
     let top_pad = 22.0;
@@ -724,7 +724,23 @@ fn draw_sequence_block(
         painter.rect_filled(left_bar, Rounding::same(0.0), Color32::from_rgb(90, 170, 255));
     }
 
-    resp
+    // ----- Delete cross (very top-left of the full record) -----
+    let cross_sz = 14.0;
+    let pad_left = 8.0; // horizontal padding from record border
+    let pad_top  = 0.0; // tighter top padding to sit higher
+    let cross_rect = Rect::from_min_size(Pos2::new(rect.left() + pad_left, rect.top() + pad_top), egui::vec2(cross_sz, cross_sz));
+    let del_id = ui.id().with("del_x").with(seq.uid);
+    let resp_cross = ui.interact(cross_rect, del_id, egui::Sense::click());
+    resp_cross.clone().on_hover_cursor(CursorIcon::PointingHand);
+    let pad = 3.0;
+    let a = cross_rect.min + egui::vec2(pad, pad);
+    let b = cross_rect.max - egui::vec2(pad, pad);
+    let col = if ! resp_cross.hovered() { Color32::from_rgb(170, 170, 170) } else { Color32::from_rgb(220, 120, 120) };
+    let sw = if resp_cross.hovered() { 2.0 } else { 1.5 };
+    painter.line_segment([Pos2::new(a.x, a.y), Pos2::new(b.x, b.y)], Stroke::new(sw, col));
+    painter.line_segment([Pos2::new(a.x, b.y), Pos2::new(b.x, a.y)], Stroke::new(sw, col));
+
+    (resp, resp_cross.clicked())
 }
 
 // ===== eframe::App =====
@@ -836,6 +852,7 @@ impl eframe::App for AppState {
             }
         }
 
+        let mut pending_delete: Option<u64> = None;
         egui::CentralPanel::default().show(ctx, |ui| {
 
             ui.horizontal(|ui| {
@@ -937,7 +954,6 @@ impl eframe::App for AppState {
             for s in &self.sequences {
                 blocks.push((s, false));
             }
-
             if blocks.is_empty() {
                 let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
                 painter.text(
@@ -955,12 +971,14 @@ impl eframe::App for AppState {
                             let is_target = !is_live && self.anim_target_uid.map_or(false, |id| id == s.uid);
                             let anim = if is_target { self.anim_scale.as_ref() } else { None };
                             let is_selected = self.selected_uid.map_or(false, |id| id == s.uid);
-                            let resp = draw_sequence_block(ctx, ui, s, is_live, anim, self.last_event, is_selected);
+                            let (resp, del_clicked) = draw_sequence_block(ctx, ui, s, is_live, anim, self.last_event, is_selected);
                             if is_selected && self.scroll_selected_into_view {
                                 resp.scroll_to_me(None);
                                 self.scroll_selected_into_view = false;
                             }
-                            if resp.clicked() {
+                            if del_clicked {
+                                pending_delete = Some(s.uid);
+                            } else if resp.clicked() {
                                 self.selected_uid = Some(s.uid);
                             }
 
@@ -974,6 +992,27 @@ impl eframe::App for AppState {
                     });
             }
         });
+
+        // Apply pending deletion from UI cross
+        if let Some(uid) = pending_delete {
+            if self.cur.as_ref().map_or(false, |s| s.uid == uid) {
+                self.force_finalize_now();
+            }
+            if let Some(pos) = self.sequences.iter().position(|s| s.uid == uid) {
+                if self.anim_target_uid == Some(uid) {
+                    self.anim_target_uid = None;
+                    self.anim_scale = None;
+                }
+                self.sequences.remove(pos);
+                if !self.sequences.is_empty() {
+                    let idx = if pos < self.sequences.len() { pos } else { self.sequences.len() - 1 };
+                    self.selected_uid = Some(self.sequences[idx].uid);
+                    self.scroll_selected_into_view = true;
+                } else {
+                    self.selected_uid = None;
+                }
+            }
+        }
 
         // ~60 FPS
         ctx.request_repaint_after(Duration::from_millis(16));
