@@ -837,8 +837,25 @@ impl eframe::App for AppState {
 
                 // Indicator at far right: cross-faded red dot ↔ listening ring
                 let icon_sz = 18.0_f32;
-                let space = (ui.available_width() - icon_sz).max(0.0);
+                let gap_icon = 8.0_f32;       // ring ↔ right edge
+                let gap_text_icon = 0.0_f32;  // text ↔ ring
+                let hint_text = if self.listening {
+                    "press <Ins> to disable listening"
+                } else {
+                    "press <Ins> to enable listening"
+                };
+                let body_font = ui.style().text_styles.get(&egui::TextStyle::Body).cloned().unwrap_or(FontId::proportional(14.0));
+                let hint_w = ctx.fonts(|f| {
+                    f.layout_no_wrap(hint_text.to_string(), body_font.clone(), Color32::WHITE)
+                        .size()
+                        .x
+                });
+                let right_pad_ui = gap_icon;
+                let space = (ui.available_width() - (hint_w + gap_text_icon + icon_sz + right_pad_ui)).max(0.0);
                 ui.add_space(space);
+                let hint_col = if self.listening { Color32::from_gray(170) } else { Color32::from_gray(160) };
+                ui.label(egui::RichText::new(hint_text).color(hint_col));
+                ui.add_space(gap_text_icon);
 
                 let (r_icon, p_icon) = ui.allocate_painter(egui::vec2(icon_sz, icon_sz), egui::Sense::hover());
                 let t = ctx.input(|i| i.time) as f32;
@@ -852,6 +869,7 @@ impl eframe::App for AppState {
                     let a = (dot_alpha * 255.0).clamp(0.0, 255.0) as u8;
                     p_icon.circle_filled(r_icon.rect.center(), r, Color32::from_rgba_unmultiplied(220, 50, 50, a));
                 }
+                ui.add_space(right_pad_ui);
             });
             ui.label(format!(
                 "Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.",
