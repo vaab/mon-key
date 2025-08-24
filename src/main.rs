@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::f32::consts::TAU;
 
 // ===== Events & parsing =====
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,7 +42,7 @@ fn parse_line(line: &str) -> Option<Event> {
     let state = parts.next()?.trim();
     let key = parts.next()?.trim().to_string();
 
-    // Filter out mouse/touchpad/pointer noise, and ignore Delete key from stdin
+    // Filter out mouse/touchpad/pointer noise, and ignore Insert key from stdin (UI owns Insert)
     let dev_l = device.to_ascii_lowercase();
     let key_l = key.to_ascii_lowercase();
     if dev_l.contains("mouse")
@@ -49,8 +50,8 @@ fn parse_line(line: &str) -> Option<Event> {
         || dev_l.contains("pointer")
         || key_l.contains("mouse")
         || key_l.starts_with("btn")
-        || key_l == "delete" // ignore Delete so UI handler owns it
-        || key_l == "del"
+        || key_l == "insert" // ignore Insert so UI handler owns it
+        || key_l == "ins"
     {
         return None;
     }
@@ -171,6 +172,13 @@ struct ScaleAnim {
     dur_ms: u64,
 }
 
+#[derive(Clone)]
+struct IndicatorFade {
+    start: Instant,
+    dur_ms: u64,
+    to_recording: bool,
+}
+
 fn lerp(a: f32, b: f32, t: f32) -> f32 {
     a + (b - a) * t
 }
@@ -197,6 +205,10 @@ struct AppState {
     next_uid: u64,
     anim_target_uid: Option<u64>,
     selected_uid: Option<u64>,
+    listening: bool,
+    // indicator cross-fade state
+    prev_recording: bool,
+    ind_fade: Option<IndicatorFade>,
 }
 
 impl AppState {
@@ -211,11 +223,18 @@ impl AppState {
             next_uid: 1,
             anim_target_uid: None,
             selected_uid: None,
+            listening: true,
+            prev_recording: false,
+            ind_fade: None,
         }
     }
 
     fn ingest(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
+            if !self.listening {
+                // Exhaust stdin but ignore events while paused
+                continue;
+            }
             match &mut self.cur {
                 None => {
                     let mut s = Sequence::new();
@@ -239,6 +258,46 @@ impl AppState {
                 }
             }
             self.last_event = Some(Instant::now());
+        }
+    }
+
+
+    fn force_finalize_now(&mut self) {
+        if let Some(mut s) = self.cur.take() {
+            // Compute visual elapsed since last event, but keep recorded times
+            // anchored at the last event time for consistency with idle finalization.
+            let vis_elapsed = self
+                .last_event
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let now = s.now_ms; // do NOT add vis_elapsed to the stored data
+
+            // Close any active holds at 'now'
+            if !s.holds.is_empty() {
+                let holds = std::mem::take(&mut s.holds);
+                for (key, start) in holds {
+                    if now == start {
+                        s.taps.push(Tap { key, at: now });
+                    } else {
+                        s.segments.push(Segment { key, start, end: now });
+                    }
+                }
+            }
+            s.idle_start = None;
+
+            // Only start a shrink animation if there isn't one already running.
+            // Animate from visual-now -> logical-now (same as idle finalization).
+            if self.anim_scale.is_none() {
+                let from = (now.saturating_add(vis_elapsed)).max(1) as f32;
+                let to = (now.max(1)) as f32;
+                self.anim_scale = Some(ScaleAnim { start: Instant::now(), from, to, dur_ms: 220 });
+                self.anim_target_uid = Some(s.uid);
+            }
+
+            let uid = s.uid;
+            self.sequences.insert(0, s);
+            // Keep selection on the same recording, now in history
+            self.selected_uid = Some(uid);
         }
     }
 
@@ -360,6 +419,90 @@ fn to_x(t_ms: u64, tmax: f32, x0: f32, x1: f32) -> f32 {
     x0 + (t_ms as f32 / tmax) * (x1 - x0)
 }
 
+#[allow(dead_code)]
+fn hsv_to_rgb(h: f32, s: f32, v: f32) -> (u8, u8, u8) {
+    // h in [0,1), s,v in [0,1]
+    let h6 = (h * 6.0).fract();
+    let i = (h * 6.0).floor() as i32;
+    let f = h6;
+    let p = v * (1.0 - s);
+    let q = v * (1.0 - s * f);
+    let t = v * (1.0 - s * (1.0 - f));
+    let (r, g, b) = match i.rem_euclid(6) {
+        0 => (v, t, p),
+        1 => (q, v, p),
+        2 => (p, v, t),
+        3 => (p, q, v),
+        4 => (t, p, v),
+        _ => (v, p, q),
+    };
+    (((r * 255.0).round() as u8), ((g * 255.0).round() as u8), ((b * 255.0).round() as u8))
+}
+
+fn draw_listening_ring(p: &egui::Painter, rect: Rect, listening: bool, time_secs: f32, alpha_mul: f32) {
+    let size_min = rect.width().min(rect.height());
+    let thickness = 3.0;
+    let pix_pad = 0.5;
+    let center = rect.center();
+    let radius = size_min * 0.5 - pix_pad - thickness * 0.5;
+
+    // Base ring (very dim when paused / subtle when listening)
+    let base_alpha = if listening { 18 } else { 12 };
+    p.circle_stroke(
+        center,
+        radius,
+        Stroke::new(
+        thickness,
+        Color32::from_rgba_unmultiplied(255, 255, 255, ((base_alpha as f32) * alpha_mul).clamp(0.0, 255.0) as u8),
+    ),
+    );
+
+    if !listening { return; }
+
+    // One-sided comet arc: fully white at the head, smoothly fading to transparent at the tail.
+    let rev_per_sec = 0.15;                  // rotation speed
+    let head = (time_secs * rev_per_sec).fract() * TAU; // radians
+    let arc_frac = 0.30;                     // fraction of full circle covered by the highlight
+    let arc_ang = arc_frac * TAU;            // radians
+    let tail = head - arc_ang;               // radians
+    let steps: usize = 120;                  // smoothness along the arc
+
+    // Mesh radii matching stroke thickness
+    let r_inner = radius - thickness * 0.5;
+    let r_outer = radius + thickness * 0.5;
+
+    let mut mesh = egui::epaint::Mesh::default();
+
+    for i in 0..=steps {
+        let t = i as f32 / steps as f32;      // 0..1 from tail → head
+        let a = tail + t * arc_ang;           // angle in radians
+        let ca = a.cos();
+        let sa = a.sin();
+
+        let p_outer = Pos2::new(center.x + r_outer * ca, center.y + r_outer * sa);
+        let p_inner = Pos2::new(center.x + r_inner * ca, center.y + r_inner * sa);
+
+        // One-sided fade: 0 at tail → 1 at head, with gentle ease & perceptual gamma
+        let s = t * t * (3.0 - 2.0 * t);      // smoothstep
+        let g = s.powf(1.6);                  // gamma curve to avoid "flat" look
+        let alpha = ((g * 235.0) * alpha_mul).clamp(0.0, 255.0) as u8;        // peak alpha near head
+        let col = Color32::from_rgba_unmultiplied(255, 255, 255, alpha);
+
+        mesh.vertices.push(egui::epaint::Vertex { pos: p_outer, uv: egui::pos2(0.0, 0.0), color: col });
+        mesh.vertices.push(egui::epaint::Vertex { pos: p_inner, uv: egui::pos2(0.0, 0.0), color: col });
+    }
+
+    // Connect as a strip
+    for i in 0..steps {
+        let i0 = (2 * i) as u32;
+        let i1 = i0 + 1;
+        let i2 = i0 + 2;
+        let i3 = i0 + 3;
+        mesh.indices.extend_from_slice(&[i0, i2, i1, i1, i2, i3]);
+    }
+
+    p.add(egui::Shape::mesh(mesh));
+}
 fn draw_finished_segments(
     painter: &egui::Painter,
     seq: &Sequence,
@@ -581,13 +724,27 @@ impl eframe::App for AppState {
         self.ingest();
         self.finalize_if_idle_elapsed();
 
-        // Delete currently selected recording with Delete key (egui input, not stdin)
-        if ctx.input(|i| i.key_pressed(Key::Delete)) {
+        // Toggle listening with Insert key
+        if ctx.input(|i| i.key_pressed(Key::Insert)) {
+            self.listening = !self.listening;
+            if !self.listening {
+                // When pausing, close the current recording immediately
+                self.force_finalize_now();
+            }
+        }
+
+        // Delete currently selected recording with Delete key (UI owns Delete only when paused)
+        if !self.listening && ctx.input(|i| i.key_pressed(Key::Delete)) {
             if let Some(sel) = self.selected_uid {
                 let mut removed = false;
                 if self.cur.as_ref().map_or(false, |s| s.uid == sel) {
-                    self.cur = None;
-                    removed = true;
+                    // If deleting the live one, finalize it first for consistency
+                    self.force_finalize_now();
+                    removed = true; // already moved to history at index 0
+                    // Now remove it from history
+                    if let Some(pos) = self.sequences.iter().position(|s| s.uid == sel) {
+                        self.sequences.remove(pos);
+                    }
                 } else if let Some(pos) = self.sequences.iter().position(|s| s.uid == sel) {
                     self.sequences.remove(pos);
                     removed = true;
@@ -617,24 +774,59 @@ impl eframe::App for AppState {
             }
         }
 
+        // --- Indicator cross-fade (ring ↔ dot) ---
+        let recording_now = self
+            .cur
+            .as_ref()
+            .map(|s| !s.holds.is_empty() || self
+                .last_event
+                .map(|t| t.elapsed() < Duration::from_millis(self.gap_ms))
+                .unwrap_or(false))
+            .unwrap_or(false);
+        if self.prev_recording != recording_now {
+            self.ind_fade = Some(IndicatorFade { start: Instant::now(), dur_ms: 60, to_recording: recording_now });
+            self.prev_recording = recording_now;
+        }
+        let (dot_alpha, ring_alpha) = match self.ind_fade.take() {
+            Some(f) => {
+                let a = (f.start.elapsed().as_millis() as f32 / f.dur_ms as f32).clamp(0.0, 1.0);
+                let a = smoothstep(a);
+                if a >= 1.0 {
+                    // fade finished; keep None
+                    if f.to_recording { (1.0, 0.0) } else { (0.0, 1.0) }
+                } else {
+                    // not finished; put it back and interpolate
+                    let to_rec = f.to_recording;
+                    self.ind_fade = Some(f);
+                    if to_rec { (a, 1.0 - a) } else { (1.0 - a, a) }
+                }
+            }
+            None => {
+                if recording_now { (1.0, 0.0) } else { (0.0, 1.0) }
+            }
+        };
+
         egui::CentralPanel::default().show(ctx, |ui| {
-            // Header: title left, red dot at far right when recording
-            let recording = self
-                .cur
-                .as_ref()
-                .map(|s| !s.holds.is_empty() || self.last_event.map(|t| t.elapsed() < Duration::from_millis(self.gap_ms)).unwrap_or(false))
-                .unwrap_or(false);
 
             ui.horizontal(|ui| {
                 ui.heading("keyd live graph");
-                let dot_w = 14.0_f32;
-                let space = (ui.available_width() - dot_w).max(0.0);
-                if space > 0.0 {
-                    ui.add_space(space);
+
+                // Indicator at far right: cross-faded red dot ↔ listening ring
+                let icon_sz = 18.0_f32;
+                let space = (ui.available_width() - icon_sz).max(0.0);
+                ui.add_space(space);
+
+                let (r_icon, p_icon) = ui.allocate_painter(egui::vec2(icon_sz, icon_sz), egui::Sense::hover());
+                let t = ctx.input(|i| i.time) as f32;
+                if ring_alpha > 0.001 {
+                    draw_listening_ring(&p_icon, r_icon.rect, self.listening, t, ring_alpha);
                 }
-                if recording {
-                    let (resp, rp) = ui.allocate_painter(egui::vec2(dot_w, dot_w), egui::Sense::hover());
-                    rp.circle_filled(resp.rect.center(), 6.0, Color32::from_rgb(220, 50, 50));
+                if dot_alpha > 0.001 {
+                    let size_min = r_icon.rect.width().min(r_icon.rect.height());
+                    let pix_pad = 0.5;
+                    let r = size_min * 0.5 - pix_pad; // match ring outer radius
+                    let a = (dot_alpha * 255.0).clamp(0.0, 255.0) as u8;
+                    p_icon.circle_filled(r_icon.rect.center(), r, Color32::from_rgba_unmultiplied(220, 50, 50, a));
                 }
             });
             ui.label(format!(
@@ -720,6 +912,6 @@ fn main() -> Result<()> {
     let rx = spawn_stdin_reader();
     let native_options = eframe::NativeOptions::default();
     let app = AppState::new(rx, gap_ms);
-    eframe::run_native("keyd live graph", native_options, Box::new(|_| Box::new(app)))
+    eframe::run_native("keyd live graph", native_options, Box::new(move |_| Box::new(app)))
         .map_err(|e| anyhow!("eframe error: {e}"))
 }
