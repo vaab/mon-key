@@ -210,6 +210,7 @@ struct AppState {
     prev_recording: bool,
     ind_fade: Option<IndicatorFade>,
     scroll_selected_into_view: bool,
+    ui_edit_active: bool,
 }
 
 impl AppState {
@@ -228,13 +229,14 @@ impl AppState {
             prev_recording: false,
             ind_fade: None,
             scroll_selected_into_view: false,
+            ui_edit_active: false,
         }
     }
 
     fn ingest(&mut self) {
         while let Ok(ev) = self.rx.try_recv() {
-            if !self.listening {
-                // Exhaust stdin but ignore events while paused
+            if !self.listening || self.ui_edit_active {
+                // Exhaust stdin but ignore events while paused or when editing UI
                 continue;
             }
             match &mut self.cur {
@@ -455,9 +457,9 @@ fn draw_listening_ring(p: &egui::Painter, rect: Rect, listening: bool, time_secs
         center,
         radius,
         Stroke::new(
-        thickness,
-        Color32::from_rgba_unmultiplied(255, 255, 255, ((base_alpha as f32) * alpha_mul).clamp(0.0, 255.0) as u8),
-    ),
+            thickness,
+            Color32::from_rgba_unmultiplied(255, 255, 255, ((base_alpha as f32) * alpha_mul).clamp(0.0, 255.0) as u8),
+        ),
     );
 
     if !listening { return; }
@@ -725,10 +727,10 @@ fn draw_sequence_block(
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.ingest();
-        self.finalize_if_idle_elapsed();
+        if !self.ui_edit_active { self.finalize_if_idle_elapsed(); }
 
         // Toggle listening with Insert key
-        if ctx.input(|i| i.key_pressed(Key::Insert)) {
+        if !self.ui_edit_active && ctx.input(|i| i.key_pressed(Key::Insert)) {
             self.listening = !self.listening;
             if !self.listening {
                 // When pausing, close the current recording immediately
@@ -776,9 +778,9 @@ impl eframe::App for AppState {
             .cur
             .as_ref()
             .map(|s| !s.holds.is_empty() || self
-                .last_event
-                .map(|t| t.elapsed() < Duration::from_millis(self.gap_ms))
-                .unwrap_or(false))
+                 .last_event
+                 .map(|t| t.elapsed() < Duration::from_millis(self.gap_ms))
+                 .unwrap_or(false))
             .unwrap_or(false);
         if self.prev_recording != recording_now {
             self.ind_fade = Some(IndicatorFade { start: Instant::now(), dur_ms: 60, to_recording: recording_now });
@@ -871,10 +873,38 @@ impl eframe::App for AppState {
                 }
                 ui.add_space(right_pad_ui);
             });
-            ui.label(format!(
-                "Records split on ≥ {} ms gaps. Thick line = hold, dot = tap.",
-                self.gap_ms
-            ));
+            ui.horizontal(|ui| {
+                ui.label("Records split on ≥");
+                let mut gap_val = self.gap_ms as i64;
+                let resp = ui.add(
+                    egui::DragValue::new(&mut gap_val)
+                        .speed(25.0)
+                        .clamp_range(200..=2000)
+                        .suffix(" ms")
+                        .fixed_decimals(0)
+                );
+
+                // While this widget is focused, temporarily pause ingest/finalize without changing UI indicators
+                self.ui_edit_active = resp.has_focus();
+
+                // Mouse wheel over the control adjusts by ±50 ms per notch
+                let wheel = ui.input(|i| i.raw_scroll_delta.y);
+                let mut changed = resp.changed();
+                if resp.hovered() && wheel.abs() > 0.0 {
+                    let step: i64 = 50;
+                    let dir: i64 = if wheel > 0.0 { -1 } else if wheel < 0.0 { 1 } else { 0 };
+                    if dir != 0 {
+                        gap_val = (gap_val + dir * step).clamp(50, 2000);
+                        changed = true;
+                    }
+                }
+
+                if changed {
+                    self.gap_ms = gap_val as u64;
+                }
+
+                ui.label("gaps. Thick line = hold, dot = tap.");
+            });
             ui.separator();
 
             // Ensure there is always a default selection
@@ -940,7 +970,7 @@ impl eframe::App for AppState {
 // ===== main =====
 fn main() -> Result<()> {
     // Parse --gap-ms <u64>
-    let mut gap_ms: u64 = 1000;
+    let mut gap_ms: u64 = 500;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
