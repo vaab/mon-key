@@ -132,7 +132,7 @@ impl AppState {
 }
 
 // ---------------- UI -----------------
-use eframe::{egui, egui::{Color32, Pos2, Rect, Stroke}};
+use eframe::{egui, egui::{Color32, Pos2, Rect, Stroke, Rounding}};
 
 // Choose a “nice” tick step (1/2/5×10^n) for the time axis
 fn nice_step(raw: f32) -> f32 {
@@ -293,16 +293,16 @@ impl eframe::App for AppState {
                     let row = s.row_index[&seg.key];
                     let y = y0 + row as f32 * row_h + row_h * 0.5;
                     let x_start = to_x(seg.start);
-                    let x_end = to_x(seg.end);
-                    // draw the hold bar
-                    painter.line_segment(
-                        [Pos2::new(x_start, y), Pos2::new(x_end, y)],
-                        Stroke::new(line_thick, Color32::from_rgb(90, 170, 255)),
-                    );
+                    let x_end = to_x(seg.end).max(x_start + 1.0); // ensure visible width
+                    let y_top = y - (line_thick * 0.5);
+                    let y_bot = y + (line_thick * 0.5);
+                    let rect_seg = Rect::from_min_max(Pos2::new(x_start, y_top), Pos2::new(x_end, y_bot));
+                    painter.rect_filled(rect_seg, Rounding::same(2.0), Color32::from_rgb(90, 170, 255));
+
                     // duration label centered above the segment (smaller and closer)
                     let mid_x = (x_start + x_end) * 0.5;
                     let dur = seg.end.saturating_sub(seg.start);
-                    let label_y = y - (line_thick * 0.5) - 1.0; // tuck just above the bar
+                    let label_y = y_top - 1.0; // tuck just above the bar
                     painter.text(
                         Pos2::new(mid_x, label_y),
                         egui::Align2::CENTER_BOTTOM,
@@ -315,11 +315,12 @@ impl eframe::App for AppState {
                 for (key, &start) in &s.holds {
                     let row = s.row_index[key];
                     let y = y0 + row as f32 * row_h + row_h * 0.5;
-                    let end_vis = now_vis_ms;
-                    painter.line_segment(
-                        [Pos2::new(to_x(start), y), Pos2::new(to_x(end_vis), y)],
-                        Stroke::new(line_thick, Color32::WHITE),
-                    );
+                    let x_start = to_x(start);
+                    let x_end = to_x(now_vis_ms).max(x_start + 1.0);
+                    let y_top = y - (line_thick * 0.5);
+                    let y_bot = y + (line_thick * 0.5);
+                    let rect_live = Rect::from_min_max(Pos2::new(x_start, y_top), Pos2::new(x_end, y_bot));
+                    painter.rect_filled(rect_live, Rounding::same(4.0), Color32::WHITE);
                 }
                 // taps
                 for tap in &s.taps {
