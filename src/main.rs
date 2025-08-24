@@ -154,8 +154,8 @@ impl Sequence {
                 self.segments.push(Segment { key: key.to_string(), start, end: self.now_ms });
             }
         } else {
-            // Up without a known down -> treat as tap
-            self.taps.push(Tap { key: key.to_string(), at: self.now_ms });
+            // Ignore stray up without prior down
+            return;
         }
         if self.holds.is_empty() {
             self.idle_start = Some((self.now_ms, key.to_string()));
@@ -237,6 +237,10 @@ impl AppState {
         while let Ok(ev) = self.rx.try_recv() {
             if !self.listening || self.ui_edit_active {
                 // Exhaust stdin but ignore events while paused or when editing UI
+                continue;
+            }
+            // Don't start a recording on stray 'Up' events (e.g., Enter release)
+            if self.cur.is_none() && matches!(ev.kind, Kind::Up) {
                 continue;
             }
             match &mut self.cur {
