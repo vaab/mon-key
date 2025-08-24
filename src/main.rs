@@ -194,6 +194,7 @@ struct AppState {
     anim_scale: Option<ScaleAnim>,
     next_uid: u64,
     anim_target_uid: Option<u64>,
+    selected_uid: Option<u64>,
 }
 
 impl AppState {
@@ -207,6 +208,7 @@ impl AppState {
             anim_scale: None,
             next_uid: 1,
             anim_target_uid: None,
+            selected_uid: None,
         }
     }
 
@@ -222,6 +224,8 @@ impl AppState {
                         Kind::Down => s.on_down(&ev.key),
                         Kind::Up => s.on_up(&ev.key),
                     }
+                    // When a new recording starts, focus/select it
+                    self.selected_uid = Some(s.uid);
                     self.cur = Some(s);
                 }
                 Some(s) => {
@@ -255,7 +259,11 @@ impl AppState {
                 self.anim_target_uid = Some(sref.uid);
             }
             if let Some(done) = self.cur.take() {
+                let uid = done.uid;
                 self.sequences.insert(0, done);
+                if self.selected_uid.is_none() {
+                    self.selected_uid = Some(uid);
+                }
             }
         }
     }
@@ -492,11 +500,14 @@ fn draw_sequence_block(
     is_live: bool,
     anim_scale: Option<&ScaleAnim>,
     last_event: Option<Instant>,
-) {
+    selected: bool,
+) -> egui::Response {
     // ---- Metrics ----
     let key_font = FontId::proportional(14.0);
     let label_pad = 20.0;
-    let left_gutter = (measure_max_label_px(ctx, &key_font, &seq.row_order) + label_pad).max(30.0);
+    let sel_w = 5.0;      // selection bar width (reserved in gutter)
+    let sel_gap = 5.0;    // gap between selection bar and labels
+    let left_gutter = (measure_max_label_px(ctx, &key_font, &seq.row_order) + label_pad + sel_w + sel_gap).max(30.0);
     let right_pad = 10.0;
     let top_pad = 22.0;
     let row_h = 28.0;
@@ -504,7 +515,10 @@ fn draw_sequence_block(
     let rows = seq.row_order.len().max(1) as f32;
     let block_h = top_pad + rows * row_h + 18.0;
 
-    let (resp, painter) = ui.allocate_painter(egui::vec2(ui.available_width(), block_h), egui::Sense::hover());
+    let (resp, painter) = ui.allocate_painter(
+        egui::vec2(ui.available_width(), block_h),
+        egui::Sense::click(),
+    );
     let rect = resp.rect;
 
     // ---- Time axis ----
@@ -537,6 +551,26 @@ fn draw_sequence_block(
     }
     draw_taps(&painter, seq, tmax, x0, x1, y0, row_h);
     draw_idle_gaps(&painter, seq, tmax, x0, x1, y0, row_h);
+
+    // Selection visuals (no margins)
+    // Dim non-selected blocks slightly (full-rect overlay, no rounding)
+    if !selected {
+        painter.rect_filled(
+            rect,
+            Rounding::same(0.0),
+            Color32::from_rgba_unmultiplied(0, 0, 0, 45),
+        );
+    } else {
+        // Thick blue bar on the left edge only, with reserved gutter space for labels
+        let sel_w = 5.0;
+        let left_bar = Rect::from_min_max(
+            Pos2::new(rect.left(), rect.top()),
+            Pos2::new((rect.left() + sel_w).min(rect.right()), rect.bottom()),
+        );
+        painter.rect_filled(left_bar, Rounding::same(0.0), Color32::from_rgb(90, 170, 255));
+    }
+
+    resp
 }
 
 // ===== eframe::App =====
@@ -579,6 +613,15 @@ impl eframe::App for AppState {
             ));
             ui.separator();
 
+            // Ensure there is always a default selection
+            if self.selected_uid.is_none() {
+                if let Some(s) = self.cur.as_ref() {
+                    self.selected_uid = Some(s.uid);
+                } else if let Some(first) = self.sequences.first() {
+                    self.selected_uid = Some(first.uid);
+                }
+            }
+
             // Blocks: live first, then history (top-most is latest)
             let mut blocks: Vec<(&Sequence, bool)> = Vec::new();
             if let Some(s) = self.cur.as_ref() {
@@ -604,13 +647,17 @@ impl eframe::App for AppState {
                         for (idx, (s, is_live)) in blocks.into_iter().enumerate() {
                             let is_target = !is_live && self.anim_target_uid.map_or(false, |id| id == s.uid);
                             let anim = if is_target { self.anim_scale.as_ref() } else { None };
-                            draw_sequence_block(ctx, ui, s, is_live, anim, self.last_event);
+                            let is_selected = self.selected_uid.map_or(false, |id| id == s.uid);
+                            let resp = draw_sequence_block(ctx, ui, s, is_live, anim, self.last_event, is_selected);
+                            if resp.clicked() {
+                                self.selected_uid = Some(s.uid);
+                            }
 
                             if idx + 1 < self.sequences.len() + if self.cur.is_some() { 1 } else { 0 } {
                                 let sep_h = 6.0;
                                 let (r2, p2) = ui.allocate_painter(egui::vec2(ui.available_width(), sep_h), egui::Sense::hover());
                                 p2.rect_filled(r2.rect, Rounding::same(3.0), Color32::from_gray(60));
-                                ui.add_space(6.0);
+                                // no extra spacing: next block sticks to the separator
                             }
                         }
                     });
