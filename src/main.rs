@@ -738,29 +738,23 @@ impl eframe::App for AppState {
         // Delete currently selected recording with Delete key (UI owns Delete only when paused)
         if !self.listening && ctx.input(|i| i.key_pressed(Key::Delete)) {
             if let Some(sel) = self.selected_uid {
-                let mut removed = false;
+                // If deleting the live one, finalize it first so it exists in history
                 if self.cur.as_ref().map_or(false, |s| s.uid == sel) {
-                    // If deleting the live one, finalize it first for consistency
                     self.force_finalize_now();
-                    removed = true; // already moved to history at index 0
-                    // Now remove it from history
-                    if let Some(pos) = self.sequences.iter().position(|s| s.uid == sel) {
-                        self.sequences.remove(pos);
-                    }
-                } else if let Some(pos) = self.sequences.iter().position(|s| s.uid == sel) {
-                    self.sequences.remove(pos);
-                    removed = true;
                 }
-                if removed {
+                if let Some(pos) = self.sequences.iter().position(|s| s.uid == sel) {
+                    // Clear any running animation targeting this item
                     if self.anim_target_uid == Some(sel) {
                         self.anim_target_uid = None;
                         self.anim_scale = None;
                     }
-                    // Pick a new selection: live first, else most recent history, else none
-                    if let Some(s) = self.cur.as_ref() {
-                        self.selected_uid = Some(s.uid);
-                    } else if let Some(first) = self.sequences.first() {
-                        self.selected_uid = Some(first.uid);
+                    // Remove it
+                    self.sequences.remove(pos);
+                    // Select neighbor: prefer the next item at same index; else previous
+                    if !self.sequences.is_empty() {
+                        let idx = if pos < self.sequences.len() { pos } else { self.sequences.len() - 1 };
+                        self.selected_uid = Some(self.sequences[idx].uid);
+                        self.scroll_selected_into_view = true;
                     } else {
                         self.selected_uid = None;
                     }
