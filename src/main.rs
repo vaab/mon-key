@@ -122,15 +122,22 @@ fn stdin_reader(_rx_gap_ms: u64) -> Receiver<Event> {
 struct AppState {
     rx: Receiver<Event>,
     gap_ms: u64,
-    prev: Option<Sequence>,
-    cur: Option<Sequence>,
+    sequences: Vec<Sequence>,   // history, most-recent first
+    cur: Option<Sequence>,      // currently recording
     last_event: Option<Instant>,
     anim_scale: Option<ScaleAnim>,
 }
 
 impl AppState {
     fn new(rx: Receiver<Event>, gap_ms: u64) -> Self {
-        Self { rx, gap_ms, prev: None, cur: None, last_event: None, anim_scale: None }
+        Self {
+            rx,
+            gap_ms,
+            sequences: Vec::new(),
+            cur: None,
+            last_event: None,
+            anim_scale: None,
+        }
     }
 
     fn ingest(&mut self) {
@@ -185,12 +192,18 @@ impl eframe::App for AppState {
             if self.cur.is_some() && elapsed_ok && !has_holds {
                 // Start scale-shrink animation from current visual time to final time
                 if let Some(sref) = self.cur.as_ref() {
-                    let vis_elapsed = self.last_event.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0);
+                    let vis_elapsed = self
+                        .last_event
+                        .map(|t| t.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
                     let from = (sref.now_ms.saturating_add(vis_elapsed)).max(1) as f32;
                     let to = (sref.now_ms.max(1)) as f32;
                     self.anim_scale = Some(ScaleAnim { start: Instant::now(), from, to, dur_ms: 220 });
                 }
-                self.prev = self.cur.take();
+                if let Some(done) = self.cur.take() {
+                    // push finished sequence to history (top)
+                    self.sequences.insert(0, done);
+                }
             }
 
             // Header row: left-aligned title + red dot at far right
@@ -208,202 +221,19 @@ impl eframe::App for AppState {
             ui.label(format!("Sequences split on ≥ {} ms gaps. Thick line = hold, dot = tap.", self.gap_ms));
             ui.separator();
 
-            let available = ui.available_size_before_wrap();
-            let (resp, painter) = ui.allocate_painter(available, egui::Sense::hover());
-            let rect = resp.rect;
+            // Draw stacked sequences: current (live) on top, then history (most-recent first)
+            let mut blocks: Vec<(&Sequence, bool, bool)> = Vec::new();
+            if let Some(s) = self.cur.as_ref() {
+                blocks.push((s, true, false));
+            }
+            for (i, s) in self.sequences.iter().enumerate() {
+                let anim_target = self.cur.is_none() && i == 0 && self.anim_scale.is_some();
+                blocks.push((s, false, anim_target));
+            }
 
-            // (finalize moved earlier before header)
-
-            // Choose which sequence to draw: live (cur) if present, else previous (prev)
-            let seq = if self.cur.is_some() { self.cur.as_ref() } else { self.prev.as_ref() };
-            if let Some(s) = seq {
-                // Dynamic gutter based on max key label width
-                let key_font = egui::FontId::proportional(14.0);
-                let max_key_label_px: f32 = ctx.fonts(|f| {
-                    s.row_order.iter().map(|k| {
-                        f.layout_no_wrap(k.clone(), key_font.clone(), Color32::WHITE).size().x
-                    }).fold(0.0, f32::max)
-                });
-                let label_pad = 20.0; // spacing between labels and plot
-                let left_gutter = (max_key_label_px + label_pad).max(30.0); // clamp to a reasonable minimum
-                let right_pad = 10.0;
-                let top_pad = 22.0;
-                let row_h = 28.0;
-                let line_thick = 10.0;
-                let dot_r = 6.0;
-
-                let rows = s.row_order.len().max(1) as f32;
-
-                // Axis mapping (visual time grows between events; smooth shrink after finalize)
-                let is_live = self.cur.is_some();
-                let vis_elapsed_ms: u64 = if is_live {
-                    self.last_event.map(|t| t.elapsed().as_millis() as u64).unwrap_or(0)
-                } else { 0 };
-                let now_vis_ms = s.now_ms.saturating_add(vis_elapsed_ms);
-                let mut tmax = (now_vis_ms.max(1)) as f32;
-                // If we are showing the previous (finalized) sequence, animate tmax down to final
-                if self.cur.is_none() {
-                    if let Some(anim) = &self.anim_scale {
-                        let a = (anim.start.elapsed().as_millis() as f32 / anim.dur_ms as f32).clamp(0.0, 1.0);
-                        tmax = lerp(anim.from, anim.to, smoothstep(a));
-                        if a >= 1.0 { self.anim_scale = None; }
-                    } else {
-                        tmax = (s.now_ms.max(1)) as f32;
-                    }
-                }
-                let x0 = rect.left() + left_gutter;
-                let x1 = rect.right() - right_pad;
-                let y0 = rect.top() + top_pad;
-
-                // time grid + tick labels
-                // Choose tick step based on available width and estimated label width
-                let label_font = egui::FontId::proportional(12.0);
-                let max_label_text = format!("{:.0} ms", tmax.round());
-                let est_label_px: f32 = ctx.fonts(|f| {
-                    let galley = f.layout_no_wrap(max_label_text, label_font.clone(), Color32::WHITE);
-                    galley.size().x
-                });
-                let min_px = est_label_px + 16.0; // label width + spacing
-                let plot_w = (x1 - x0).max(1.0);
-                let mut step_ms = nice_step(tmax / 8.0);
-                loop {
-                    let dx = (step_ms / tmax) * plot_w;
-                    if dx >= min_px { break; }
-                    let next = nice_step(step_ms * 1.5);
-                    if (next - step_ms).abs() < f32::EPSILON { break; }
-                    step_ms = next;
-                }
-                let mut ms = 0.0f32;
-                while ms <= tmax + 0.0001 {
-                    let x = x0 + (ms / tmax) * (x1 - x0);
-                    painter.line_segment(
-                        [Pos2::new(x, y0), Pos2::new(x, y0 + rows * row_h)],
-                        Stroke::new(1.0, Color32::from_gray(60)),
-                    );
-                    painter.text(
-                        Pos2::new(x, y0 - 6.0),
-                        egui::Align2::CENTER_BOTTOM,
-                        format!("{:.0} ms", ms.round()),
-                        label_font.clone(),
-                        Color32::GRAY,
-                    );
-                    ms += step_ms;
-                }
-
-                // labels + baselines (right‑aligned to x0)
-                for (i, key) in s.row_order.iter().enumerate() {
-                    let y = y0 + i as f32 * row_h + row_h * 0.5;
-                    let label_x = x0 - label_pad; // use the same computed pad
-                    painter.text(
-                        Pos2::new(label_x, y),
-                        egui::Align2::RIGHT_CENTER,
-                        key,
-                        key_font.clone(),
-                        Color32::LIGHT_GRAY,
-                    );
-                    painter.line_segment(
-                        [Pos2::new(x0, y), Pos2::new(x1, y)],
-                        Stroke::new(1.0, Color32::from_gray(40)),
-                    );
-                }
-
-                // helper for x mapping
-                let to_x = |t_ms: u64| -> f32 { x0 + (t_ms as f32 / tmax) * (x1 - x0) };
-
-                // finished segments
-                for seg in &s.segments {
-                    let row = s.row_index[&seg.key];
-                    let y = y0 + row as f32 * row_h + row_h * 0.5;
-                    let x_start = to_x(seg.start);
-                    let x_end = to_x(seg.end).max(x_start + 1.0); // ensure visible width
-                    let y_top = y - (line_thick * 0.5);
-                    let y_bot = y + (line_thick * 0.5);
-                    let rect_seg = Rect::from_min_max(Pos2::new(x_start, y_top), Pos2::new(x_end, y_bot));
-                    painter.rect_filled(rect_seg, Rounding::same(2.0), Color32::from_rgb(90, 170, 255));
-
-                    // duration label centered above the segment (smaller and closer)
-                    let mid_x = (x_start + x_end) * 0.5;
-                    let dur = seg.end.saturating_sub(seg.start);
-                    let label_y = y_top - 1.0; // tuck just above the bar
-                    painter.text(
-                        Pos2::new(mid_x, label_y),
-                        egui::Align2::CENTER_BOTTOM,
-                        format!("{} ms", dur),
-                        egui::FontId::proportional(10.0),
-                        Color32::LIGHT_GRAY,
-                    );
-                }
-                // active holds (draw to visual now in white)
-                for (key, &start) in &s.holds {
-                    let row = s.row_index[key];
-                    let y = y0 + row as f32 * row_h + row_h * 0.5;
-                    let x_start = to_x(start);
-                    let x_end = to_x(now_vis_ms).max(x_start + 1.0);
-                    let y_top = y - (line_thick * 0.5);
-                    let y_bot = y + (line_thick * 0.5);
-                    let rect_live = Rect::from_min_max(Pos2::new(x_start, y_top), Pos2::new(x_end, y_bot));
-                    painter.rect_filled(rect_live, Rounding::same(4.0), Color32::WHITE);
-                }
-                // taps
-                for tap in &s.taps {
-                    let row = s.row_index[&tap.key];
-                    let y = y0 + row as f32 * row_h + row_h * 0.5;
-                    painter.circle_filled(Pos2::new(to_x(tap.at), y), dot_r, Color32::from_rgb(255, 210, 100));
-                }
-
-                // idle gaps visualization (only completed gaps)
-                for idle in &s.idles {
-                    if idle.end <= idle.start { continue; }
-                    let xs = to_x(idle.start);
-                    let xe = to_x(idle.end);
-                    let row_s = s.row_index[&idle.from_key];
-                    let row_e = s.row_index[&idle.to_key];
-                    let ys = y0 + row_s as f32 * row_h + row_h * 0.5;
-                    let ye = y0 + row_e as f32 * row_h + row_h * 0.5;
-                    let thin = Stroke::new(1.0, Color32::from_rgba_unmultiplied(180,180,180,128));
-
-                    // choose arrow row: first below, else above, else same
-                    let arrow_row: usize = if row_s == row_e {
-                        row_s
-                    } else if row_e > row_s {
-                        (row_s + 1).min(s.row_order.len() - 1)
-                    } else {
-                        row_s.saturating_sub(1)
-                    };
-                    let y_arrow = y0 + arrow_row as f32 * row_h + row_h * 0.5;
-                    // vertical lines
-                    painter.line_segment([Pos2::new(xs, ys), Pos2::new(xs, y_arrow)], thin);
-                    painter.line_segment([Pos2::new(xe, ye), Pos2::new(xe, y_arrow)], thin);
-                    // horizontal double arrow (dotted)
-                    let dotted_col = Color32::from_rgba_unmultiplied(200,200,200,150);
-                    let step = 4.0; // px between dots
-                    let dot_r2 = 0.8;
-                    let mut x = xs;
-                    while x <= xe {
-                        painter.circle_filled(Pos2::new(x, y_arrow), dot_r2, dotted_col);
-                        x += step;
-                    }
-                    let ah = 5.0; // arrowhead half size
-                    // left arrow head
-                    painter.line_segment([Pos2::new(xs + ah, y_arrow - ah*0.6), Pos2::new(xs, y_arrow)], thin);
-                    painter.line_segment([Pos2::new(xs + ah, y_arrow + ah*0.6), Pos2::new(xs, y_arrow)], thin);
-                    // right arrow head
-                    painter.line_segment([Pos2::new(xe - ah, y_arrow - ah*0.6), Pos2::new(xe, y_arrow)], thin);
-                    painter.line_segment([Pos2::new(xe - ah, y_arrow + ah*0.6), Pos2::new(xe, y_arrow)], thin);
-
-                    // label at middle
-                    let mid_x = (xs + xe) * 0.5;
-                    let dur = (idle.end - idle.start) as u64;
-                    painter.text(
-                        Pos2::new(mid_x, y_arrow - 2.0),
-                        egui::Align2::CENTER_BOTTOM,
-                        format!("{} ms", dur),
-                        egui::FontId::proportional(10.0),
-                        Color32::from_rgba_unmultiplied(200,200,200,160),
-                    );
-                }
-
-            } else {
+            if blocks.is_empty() {
+                let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+                let rect = resp.rect;
                 painter.text(
                     rect.center(),
                     egui::Align2::CENTER_CENTER,
@@ -411,9 +241,265 @@ impl eframe::App for AppState {
                     egui::FontId::proportional(16.0),
                     Color32::GRAY,
                 );
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        for (idx, (s, is_live, anim_target)) in blocks.iter().enumerate() {
+                            // ---- Layout metrics for this block ----
+                            let key_font = egui::FontId::proportional(14.0);
+                            let max_key_label_px: f32 = ctx.fonts(|f| {
+                                s.row_order
+                                    .iter()
+                                    .map(|k| f.layout_no_wrap(k.clone(), key_font.clone(), Color32::WHITE).size().x)
+                                    .fold(0.0, f32::max)
+                            });
+                            let label_pad = 20.0;
+                            let left_gutter = (max_key_label_px + label_pad).max(30.0);
+                            let right_pad = 10.0;
+                            let top_pad = 22.0;
+                            let row_h = 28.0;
+                            let line_thick = 10.0;
+                            let dot_r = 6.0;
+                            let rows = s.row_order.len().max(1) as f32;
+                            let block_h = top_pad + rows * row_h + 18.0; // bottom pad for labels
+
+                            // ---- Allocate painter for this sequence ----
+                            let (resp, painter) = ui.allocate_painter(
+                                egui::vec2(ui.available_width(), block_h),
+                                egui::Sense::hover(),
+                            );
+                            let rect = resp.rect;
+
+                            // ---- Time axis & scaling ----
+                            let vis_elapsed_ms: u64 = if *is_live {
+                                self
+                                    .last_event
+                                    .map(|t| t.elapsed().as_millis() as u64)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            };
+                            let now_vis_ms = s.now_ms.saturating_add(vis_elapsed_ms);
+                            let mut tmax = (now_vis_ms.max(1)) as f32;
+                            if *anim_target {
+                                if let Some(anim) = &self.anim_scale {
+                                    let a =
+                                        (anim.start.elapsed().as_millis() as f32 / anim.dur_ms as f32)
+                                        .clamp(0.0, 1.0);
+                                    tmax = lerp(anim.from, anim.to, smoothstep(a));
+                                    if a >= 1.0 {
+                                        self.anim_scale = None;
+                                    }
+                                }
+                            } else if !*is_live {
+                                tmax = (s.now_ms.max(1)) as f32;
+                            }
+
+                            let x0 = rect.left() + left_gutter;
+                            let x1 = rect.right() - right_pad;
+                            let y0 = rect.top() + top_pad;
+
+                            // ---- Grid + ticks (auto density) ----
+                            let label_font = egui::FontId::proportional(12.0);
+                            let max_label_text = format!("{:.0} ms", tmax.round());
+                            let est_label_px: f32 = ctx.fonts(|f| {
+                                f.layout_no_wrap(max_label_text, label_font.clone(), Color32::WHITE)
+                                    .size()
+                                    .x
+                            });
+                            let min_px = est_label_px + 16.0;
+                            let plot_w = (x1 - x0).max(1.0);
+                            let mut step_ms = nice_step(tmax / 8.0);
+                            loop {
+                                let dx = (step_ms / tmax) * plot_w;
+                                if dx >= min_px {
+                                    break;
+                                }
+                                let next = nice_step(step_ms * 1.5);
+                                if (next - step_ms).abs() < f32::EPSILON {
+                                    break;
+                                }
+                                step_ms = next;
+                            }
+                            let mut ms = 0.0_f32;
+                            while ms <= tmax + 0.0001 {
+                                let x = x0 + (ms / tmax) * (x1 - x0);
+                                painter.line_segment(
+                                    [Pos2::new(x, y0), Pos2::new(x, y0 + rows * row_h)],
+                                    Stroke::new(1.0, Color32::from_gray(60)),
+                                );
+                                painter.text(
+                                    Pos2::new(x, y0 - 6.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    format!("{:.0} ms", ms.round()),
+                                    label_font.clone(),
+                                    Color32::GRAY,
+                                );
+                                ms += step_ms;
+                            }
+
+                            // ---- Labels + baselines ----
+                            for (i, key) in s.row_order.iter().enumerate() {
+                                let y = y0 + i as f32 * row_h + row_h * 0.5;
+                                let label_x = x0 - label_pad;
+                                painter.text(
+                                    Pos2::new(label_x, y),
+                                    egui::Align2::RIGHT_CENTER,
+                                    key,
+                                    key_font.clone(),
+                                    Color32::LIGHT_GRAY,
+                                );
+                                painter.line_segment(
+                                    [Pos2::new(x0, y), Pos2::new(x1, y)],
+                                    Stroke::new(1.0, Color32::from_gray(40)),
+                                );
+                            }
+
+                            // Helper for mapping time → x
+                            let to_x = |t_ms: u64| -> f32 { x0 + (t_ms as f32 / tmax) * (x1 - x0) };
+
+                            // ---- Finished segments ----
+                            for seg in &s.segments {
+                                let row = s.row_index[&seg.key];
+                                let y = y0 + row as f32 * row_h + row_h * 0.5;
+                                let x_start = to_x(seg.start);
+                                let x_end = to_x(seg.end).max(x_start + 1.0);
+                                let y_top = y - (line_thick * 0.5);
+                                let y_bot = y + (line_thick * 0.5);
+                                let rect_seg =
+                                    Rect::from_min_max(Pos2::new(x_start, y_top), Pos2::new(x_end, y_bot));
+                                painter.rect_filled(
+                                    rect_seg,
+                                    Rounding::same(2.0),
+                                    Color32::from_rgb(90, 170, 255),
+                                );
+
+                                // Duration label (small, close to bar)
+                                let mid_x = (x_start + x_end) * 0.5;
+                                let dur = seg.end.saturating_sub(seg.start);
+                                let label_y = y_top - 1.0;
+                                painter.text(
+                                    Pos2::new(mid_x, label_y),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    format!("{} ms", dur),
+                                    egui::FontId::proportional(10.0),
+                                    Color32::LIGHT_GRAY,
+                                );
+                            }
+
+                            // ---- Active holds (live, white) ----
+                            if *is_live {
+                                for (key, &start) in &s.holds {
+                                    let row = s.row_index[key];
+                                    let y = y0 + row as f32 * row_h + row_h * 0.5;
+                                    let x_start = to_x(start);
+                                    let x_end = to_x(now_vis_ms).max(x_start + 1.0);
+                                    let y_top = y - (line_thick * 0.5);
+                                    let y_bot = y + (line_thick * 0.5);
+                                    let rect_live = Rect::from_min_max(
+                                        Pos2::new(x_start, y_top),
+                                        Pos2::new(x_end, y_bot),
+                                    );
+                                    painter.rect_filled(rect_live, Rounding::same(4.0), Color32::WHITE);
+                                }
+                            }
+
+                            // ---- Taps ----
+                            for tap in &s.taps {
+                                let row = s.row_index[&tap.key];
+                                let y = y0 + row as f32 * row_h + row_h * 0.5;
+                                painter.circle_filled(
+                                    Pos2::new(to_x(tap.at), y),
+                                    dot_r,
+                                    Color32::from_rgb(255, 210, 100),
+                                );
+                            }
+
+                            // ---- Idle gaps ----
+                            for idle in &s.idles {
+                                if idle.end <= idle.start {
+                                    continue;
+                                }
+                                let xs = to_x(idle.start);
+                                let xe = to_x(idle.end);
+                                let row_s = s.row_index[&idle.from_key];
+                                let row_e = s.row_index[&idle.to_key];
+                                let ys = y0 + row_s as f32 * row_h + row_h * 0.5;
+                                let ye = y0 + row_e as f32 * row_h + row_h * 0.5;
+                                let thin =
+                                    Stroke::new(1.0, Color32::from_rgba_unmultiplied(180, 180, 180, 128));
+
+                                let arrow_row: usize = if row_s == row_e {
+                                    row_s
+                                } else if row_e > row_s {
+                                    (row_s + 1).min(s.row_order.len() - 1)
+                                } else {
+                                    row_s.saturating_sub(1)
+                                };
+                                let y_arrow = y0 + arrow_row as f32 * row_h + row_h * 0.5;
+
+                                // Vertical lines from each key row to the arrow row
+                                painter.line_segment([Pos2::new(xs, ys), Pos2::new(xs, y_arrow)], thin);
+                                painter.line_segment([Pos2::new(xe, ye), Pos2::new(xe, y_arrow)], thin);
+
+                                // Dotted horizontal arrow
+                                let dotted_col =
+                                    Color32::from_rgba_unmultiplied(200, 200, 200, 150);
+                                let step = 4.0;
+                                let dot_r2 = 0.8;
+                                let mut x = xs;
+                                while x <= xe {
+                                    painter.circle_filled(Pos2::new(x, y_arrow), dot_r2, dotted_col);
+                                    x += step;
+                                }
+                                let ah = 5.0;
+                                painter.line_segment(
+                                    [Pos2::new(xs + ah, y_arrow - ah * 0.6), Pos2::new(xs, y_arrow)],
+                                    thin,
+                                );
+                                painter.line_segment(
+                                    [Pos2::new(xs + ah, y_arrow + ah * 0.6), Pos2::new(xs, y_arrow)],
+                                    thin,
+                                );
+                                painter.line_segment(
+                                    [Pos2::new(xe - ah, y_arrow - ah * 0.6), Pos2::new(xe, y_arrow)],
+                                    thin,
+                                );
+                                painter.line_segment(
+                                    [Pos2::new(xe - ah, y_arrow + ah * 0.6), Pos2::new(xe, y_arrow)],
+                                    thin,
+                                );
+
+                                // Duration label
+                                let mid_x = (xs + xe) * 0.5;
+                                let dur = (idle.end - idle.start) as u64;
+                                painter.text(
+                                    Pos2::new(mid_x, y_arrow - 2.0),
+                                    egui::Align2::CENTER_BOTTOM,
+                                    format!("{} ms", dur),
+                                    egui::FontId::proportional(10.0),
+                                    Color32::from_rgba_unmultiplied(200, 200, 200, 160),
+                                );
+                            }
+
+                            // ---- Separator bar between graphs (skip after last) ----
+                            if idx + 1 < blocks.len() {
+                                let sep_h = 6.0;
+                                let (r2, p2) = ui.allocate_painter(
+                                    egui::vec2(ui.available_width(), sep_h),
+                                    egui::Sense::hover(),
+                                );
+                                p2.rect_filled(r2.rect, Rounding::same(3.0), Color32::from_gray(60));
+                                ui.add_space(6.0);
+                            }
+                        }
+                    });
             }
         });
-        ctx.request_repaint_after(std::time::Duration::from_millis(16)); // ~60 FPS
+
+        // ~60 FPS
+        ctx.request_repaint_after(Duration::from_millis(16)); // ~60 FPS
     }
 }
 
