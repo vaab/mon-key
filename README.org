@@ -1,11 +1,11 @@
 #+TITLE: mon-key
 #+OPTIONS: toc:nil num:nil
 
-A small Rust/egui desktop viewer that turns the output of
-~keyd monitor -t~ into a live timeline. If you are trying to fine-tune some
-timings using [[https://github.com/rvaiya/keyd][keyd]] to get (for instance) the perfect [[https://precondition.github.io/home-row-mods][home-row mods]] setup
-to avoid false-positive, this might help you get an idea of why you
-get them, and what would be the ultimate values.
+A small Rust/egui desktop viewer that your keyboard input into a live
+precise timeline. If you are trying to fine-tune some timings using
+[[https://github.com/rvaiya/keyd][keyd]], [[https://github.com/jtroo/kanata][kanata]], [[https://github.com/david-janssen/kmonad][kmonad]] to get (for instance) the perfect [[https://precondition.github.io/home-row-mods][home-row mods]]
+setup to avoid false-positive, this might help you get an idea of why
+you get them, and what would be the ultimate values.
 
 https://github.com/user-attachments/assets/b81ab719-0c41-4296-a0f3-5dae49d8b679
 
@@ -38,11 +38,11 @@ cargo build --release
 
 ** Running the tool
 
-Input comes from =stdin=; no socket or file is required. The window is
-an egui/eframe X11 application.
+Input comes from a selected keyboard evdev device. The GUI is
+using egui/eframe X11 application.
 
 #+begin_src sh
-sudo keyd monitor -t | ./target/release/mon-key
+./target/release/mon-key
 #+end_src
 
 ** GUI interaction
@@ -74,12 +74,10 @@ You can use:
 * Future Development
 
 I have several small ideas that I'll explore maybe:
-- plug directly to input controller to give more precise timings and
-  not depend on ~keyd~. Possibly comparing output of a ~keyd~
-  configured virtual keyboard with the actual keystrokes on the
-  keyboard.
+- plug before and after virtualkey board to compare timings sent
+  and key outputted by your favorite keyboard remapper.
 - persistent store in sqlite3 so we can collect readings.
-- grouping of readings
+- grouping of readings.
 - replaying possibility ?
   The idea would be here to see if we can collect samples of problematic
   reading for a home-row modifiers configuration, and see if we couldn't

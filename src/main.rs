@@ -1,11 +1,19 @@
 use anyhow::{anyhow, Result};
-use crossbeam_channel::{unbounded, Receiver};
+use crossbeam_channel::Receiver;
 use eframe::{egui, egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Stroke, Key, CursorIcon}};
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader};
-use std::thread;
 use std::time::{Duration, Instant};
 use std::f32::consts::TAU;
+
+mod evdev_reader;
+mod kbd;
+
+use std::path::PathBuf;
+
+#[derive(Clone)]
+enum InputSource {
+    Evdev(PathBuf),
+}
 
 // ===== Events & parsing =====
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,68 +29,6 @@ struct Event {
     kind: Kind,
 }
 
-fn parse_line(line: &str) -> Option<Event> {
-    // Format: "+321 ms <device>    <id>    <key> <down|up>"
-    let mut cols = line.split('\t');
-    let delta_col = cols.next()?; // "+321 ms"
-    let device = cols.next()?; // device string
-    let _id = cols.next()?; // id (unused)
-    let last = cols.next()?; // e.g., "leftcontrol down"
-
-    // Parse delta
-    let delta_ms: u64 = delta_col
-        .chars()
-        .filter(|c| c.is_ascii_digit())
-        .collect::<String>()
-        .parse()
-        .ok()?;
-
-    // Split into key + state
-    let mut parts = last.rsplitn(2, ' ');
-    let state = parts.next()?.trim();
-    let key = parts.next()?.trim().to_string();
-
-    // Filter out mouse/touchpad/pointer noise, and ignore Insert key from stdin (UI owns Insert)
-    let dev_l = device.to_ascii_lowercase();
-    let key_l = key.to_ascii_lowercase();
-    if dev_l.contains("mouse")
-        || dev_l.contains("touchpad")
-        || dev_l.contains("pointer")
-        || key_l.contains("mouse")
-        || key_l.starts_with("btn")
-        || key_l == "insert" // ignore Insert so UI handler owns it
-        || key_l == "ins"
-    {
-        return None;
-    }
-
-    let kind = match state {
-        "down" => Kind::Down,
-        "up" => Kind::Up,
-        _ => return None,
-    };
-    Some(Event { delta_ms, key, kind })
-}
-
-fn spawn_stdin_reader() -> Receiver<Event> {
-    let (tx, rx) = unbounded();
-    thread::spawn(move || {
-        let stdin = std::io::stdin();
-        for line in BufReader::new(stdin).lines() {
-            match line {
-                Ok(l) => {
-                    if let Some(ev) = parse_line(&l) {
-                        if tx.send(ev).is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    rx
-}
 
 // ===== Sequence model =====
 #[derive(Default, Clone)]
@@ -196,7 +142,7 @@ fn nice_step(raw: f32) -> f32 {
 }
 
 struct AppState {
-    rx: Receiver<Event>,
+    rx: Option<Receiver<Event>>,
     gap_ms: u64,
     sequences: Vec<Sequence>, // history, most-recent first
     cur: Option<Sequence>,    // recording
@@ -211,11 +157,15 @@ struct AppState {
     ind_fade: Option<IndicatorFade>,
     scroll_selected_into_view: bool,
     ui_edit_active: bool,
+    devices: Vec<evdev_reader::DeviceInfo>,
+    selected_dev_idx: Option<usize>,
+    source: InputSource,
 }
 
 impl AppState {
-    fn new(rx: Receiver<Event>, gap_ms: u64) -> Self {
-        Self {
+    fn new(rx: Option<Receiver<Event>>, gap_ms: u64, source: InputSource) -> Self {
+        let has_rx = rx.is_some();
+        let mut s = Self {
             rx,
             gap_ms,
             sequences: Vec::new(),
@@ -225,18 +175,57 @@ impl AppState {
             next_uid: 1,
             anim_target_uid: None,
             selected_uid: None,
-            listening: true,
+            listening: has_rx,
             prev_recording: false,
             ind_fade: None,
             scroll_selected_into_view: false,
             ui_edit_active: false,
-        }
+            devices: Vec::new(),
+            selected_dev_idx: None,
+            source,
+        };
+        // Pre-populate device list so the picker isn't empty on first open
+        s.refresh_devices();
+        s
+    }
+    fn refresh_devices(&mut self) {
+        // remember current selection by path (robust to sort/reorder)
+        let selected_path = self.selected_dev_idx
+            .and_then(|i| self.devices.get(i))
+            .map(|d| d.path.clone());
+
+        // enumerate → filter → sort
+        let mut list: Vec<_> = kbd::collect_devices();
+        list.sort_by(|a, b| {
+            a.name.to_lowercase()
+                .cmp(&b.name.to_lowercase())
+                .then_with(|| a.path.cmp(&b.path))
+        });
+
+        self.devices = list;
+
+        // restore selection if the same device still exists
+        self.selected_dev_idx = selected_path
+            .and_then(|p| self.devices.iter().position(|d| d.path == p));
+    }
+    fn set_evdev_source(&mut self, idx: usize) {
+        if idx >= self.devices.len() { return; }
+        let path = self.devices[idx].path.clone();
+        self.rx = Some(evdev_reader::spawn_evdev_reader(path.clone()));
+        self.source = InputSource::Evdev(path);
+        self.selected_dev_idx = Some(idx);
+        // reset capture state
+        self.cur = None;
+        self.last_event = None;
+
+        // ⬅️ auto-enable listening once a device is selected
+        self.listening = true;
     }
 
     fn ingest(&mut self) {
-        while let Ok(ev) = self.rx.try_recv() {
+        let Some(rx) = &self.rx else { return; };
+        while let Ok(ev) = rx.try_recv() {
             if !self.listening || self.ui_edit_active {
-                // Exhaust stdin but ignore events while paused or when editing UI
                 continue;
             }
             // Don't start a recording on stray 'Up' events (e.g., Enter release)
@@ -269,7 +258,6 @@ impl AppState {
             self.last_event = Some(Instant::now());
         }
     }
-
 
     fn force_finalize_now(&mut self) {
         if let Some(mut s) = self.cur.take() {
@@ -746,15 +734,22 @@ fn draw_sequence_block(
 // ===== eframe::App =====
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // If no device is selected/bound, force listening off
+        if self.rx.is_none() && self.listening {
+            self.listening = false;
+        }
+
         self.ingest();
         if !self.ui_edit_active { self.finalize_if_idle_elapsed(); }
 
         // Toggle listening with Insert key
         if !self.ui_edit_active && ctx.input(|i| i.key_pressed(Key::Insert)) {
-            self.listening = !self.listening;
-            if !self.listening {
-                // When pausing, close the current recording immediately
-                self.force_finalize_now();
+            if self.rx.is_some() {
+                self.listening = !self.listening;
+                if !self.listening {
+                    // When pausing, close the current recording immediately
+                    self.force_finalize_now();
+                }
             }
         }
 
@@ -856,52 +851,89 @@ impl eframe::App for AppState {
         egui::CentralPanel::default().show(ctx, |ui| {
 
             ui.horizontal(|ui| {
-                ui.heading("keyd live graph");
+                ui.heading("keystrokes live graph");
+                ui.add_space(12.0);
 
-                // Indicator at far right: cross-faded red dot ↔ listening ring
-                let icon_sz = 18.0_f32;
-                let gap_icon = 8.0_f32;       // ring ↔ right edge
-                let gap_text_icon = 0.0_f32;  // text ↔ ring
-                let hint_text = if self.listening {
-                    "press <Ins> or click to disable listening"
-                } else {
-                    "press <Ins> or click to enable listening"
-                };
-                let body_font = ui.style().text_styles.get(&egui::TextStyle::Body).cloned().unwrap_or(FontId::proportional(14.0));
-                let hint_w = ctx.fonts(|f| {
-                    f.layout_no_wrap(hint_text.to_string(), body_font.clone(), Color32::WHITE)
-                        .size()
-                        .x
-                });
-                let right_pad_ui = gap_icon;
-                let space = (ui.available_width() - (hint_w + gap_text_icon + icon_sz + right_pad_ui)).max(0.0);
-                ui.add_space(space);
-                let hint_col = if self.listening { Color32::from_gray(170) } else { Color32::from_gray(160) };
-                ui.label(egui::RichText::new(hint_text).color(hint_col));
-                ui.add_space(gap_text_icon);
+                // open -> refresh devices
+                egui::ComboBox::from_id_source("device_picker")
+                    .selected_text(match (&self.source, self.selected_dev_idx) {
+                        (InputSource::Evdev(_), Some(i)) => {
+                            if let Some(d) = self.devices.get(i) {
+                                format!("{} ({})", d.name, d.path.display())
+                            } else { "Select device…".to_string() }
+                        }
+                        _ => "Select device…".to_string(),
+                    })
+                    .show_ui(ui, |ui| {
+                        let mut pick: Option<usize> = None;
 
-                let (r_icon, p_icon) = ui.allocate_painter(egui::vec2(icon_sz, icon_sz), egui::Sense::click());
-                let t = ctx.input(|i| i.time) as f32;
-                if ring_alpha > 0.001 {
-                    draw_listening_ring(&p_icon, r_icon.rect, self.listening, t, ring_alpha);
+                        for (i, d) in self.devices.iter().enumerate() {
+                            let label = format!("{}  [{}:{}]  {}",
+                                                d.name, d.vendor.unwrap_or(0), d.product.unwrap_or(0), d.path.display());
+                            if ui.selectable_label(self.selected_dev_idx == Some(i), label).clicked() {
+                                pick = Some(i);
+                            }
+                        }
+
+                        if let Some(i) = pick {
+                            self.set_evdev_source(i);
+                            ui.close_menu();
+                        }
+                    });
+
+                // keep the explicit refresh button:
+                if ui.button("↻").on_hover_text("Refresh devices").clicked() {
+                    self.refresh_devices();
                 }
-                if dot_alpha > 0.001 {
-                    let size_min = r_icon.rect.width().min(r_icon.rect.height());
-                    let pix_pad = 0.5;
-                    let r = size_min * 0.5 - pix_pad; // match ring outer radius
-                    let a = (dot_alpha * 255.0).clamp(0.0, 255.0) as u8;
-                    p_icon.circle_filled(r_icon.rect.center(), r, Color32::from_rgba_unmultiplied(220, 50, 50, a));
-                }
-                // Toggle listening when clicking the ring/dot
-                if r_icon.clicked() && !self.ui_edit_active {
-                    self.listening = !self.listening;
-                    if !self.listening {
-                        self.force_finalize_now();
+
+                if self.rx.is_some() {
+                    // Indicator at far right: cross-faded red dot ↔ listening ring
+                    let icon_sz = 18.0_f32;
+                    let gap_icon = 8.0_f32;       // ring ↔ right edge
+                    let gap_text_icon = 0.0_f32;  // text ↔ ring
+                    let hint_text = if self.listening {
+                        "press <Ins> or click to disable listening"
+                    } else {
+                        "press <Ins> or click to enable listening"
+                    };
+                    let body_font = ui.style().text_styles.get(&egui::TextStyle::Body).cloned().unwrap_or(FontId::proportional(14.0));
+                    let hint_w = ctx.fonts(|f| {
+                        f.layout_no_wrap(hint_text.to_string(), body_font.clone(), Color32::WHITE)
+                            .size()
+                            .x
+                    });
+                    let right_pad_ui = gap_icon;
+                    let space = (ui.available_width() - (hint_w + gap_text_icon + icon_sz + right_pad_ui)).max(0.0);
+                    ui.add_space(space);
+                    let hint_col = if self.listening { Color32::from_gray(170) } else { Color32::from_gray(160) };
+                    ui.label(egui::RichText::new(hint_text).color(hint_col));
+                    ui.add_space(gap_text_icon);
+
+                    let (r_icon, p_icon) = ui.allocate_painter(egui::vec2(icon_sz, icon_sz), egui::Sense::click());
+                    let t = ctx.input(|i| i.time) as f32;
+                    if ring_alpha > 0.001 {
+                        draw_listening_ring(&p_icon, r_icon.rect, self.listening, t, ring_alpha);
                     }
+                    if dot_alpha > 0.001 {
+                        let size_min = r_icon.rect.width().min(r_icon.rect.height());
+                        let pix_pad = 0.5;
+                        let r = size_min * 0.5 - pix_pad; // match ring outer radius
+                        let a = (dot_alpha * 255.0).clamp(0.0, 255.0) as u8;
+                        p_icon.circle_filled(r_icon.rect.center(), r, Color32::from_rgba_unmultiplied(220, 50, 50, a));
+                    }
+                    // Toggle listening when clicking the ring/dot
+                    if r_icon.clicked() && !self.ui_edit_active {
+                        if self.rx.is_some() {
+                            self.listening = !self.listening;
+                            if !self.listening {
+                                self.force_finalize_now();
+                            }
+                        }
+                    }
+                    // Pointer hint
+                    r_icon.on_hover_cursor(CursorIcon::PointingHand);
+                    ui.add_space(right_pad_ui);
                 }
-                // Pointer hint
-                r_icon.on_hover_cursor(CursorIcon::PointingHand);
-                ui.add_space(right_pad_ui);
             });
             ui.horizontal(|ui| {
                 ui.label("Records split on ≥");
@@ -956,10 +988,27 @@ impl eframe::App for AppState {
             }
             if blocks.is_empty() {
                 let (resp, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::hover());
+
+                let label = if self.rx.is_none() {
+                    "Select an input device above".to_string()
+                } else {
+                    // show the selected device name (fallback to path)
+                    let dev_name = self
+                        .selected_dev_idx
+                        .and_then(|i| self.devices.get(i))
+                        .map(|d| d.name.clone())
+                        .or_else(|| match &self.source {
+                            InputSource::Evdev(p) if !p.as_os_str().is_empty() => Some(p.display().to_string()),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| "selected device".to_string());
+                    format!("Waiting for input on {}", dev_name)
+                };
+
                 painter.text(
                     resp.rect.center(),
                     Align2::CENTER_CENTER,
-                    "Waiting for input on stdin…",
+                    label,
                     FontId::proportional(16.0),
                     Color32::GRAY,
                 );
@@ -1021,25 +1070,36 @@ impl eframe::App for AppState {
 
 // ===== main =====
 fn main() -> Result<()> {
-    // Parse --gap-ms <u64>
+    // Defaults
     let mut gap_ms: u64 = 500;
+    let mut mode: Option<InputSource> = None;
+
+    // Parse args: --gap-ms, --evdev /dev/input/eventX
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--gap-ms" | "-g" => {
                 if let Some(v) = args.next() {
-                    if let Ok(n) = v.parse() {
-                        gap_ms = n;
-                    }
+                    if let Ok(n) = v.parse() { gap_ms = n; }
+                }
+            }
+            "--evdev" => {
+                if let Some(p) = args.next() {
+                    mode = Some(InputSource::Evdev(PathBuf::from(p)));
                 }
             }
             _ => {}
         }
     }
 
-    let rx = spawn_stdin_reader();
+    // Initialize source
+    let (rx_opt, source) = match mode {
+        Some(InputSource::Evdev(ref p)) => (Some(evdev_reader::spawn_evdev_reader(p.clone())), InputSource::Evdev(p.clone())),
+        None => (None, InputSource::Evdev(PathBuf::new())), // no device yet; pick from UI
+    };
+
     let native_options = eframe::NativeOptions::default();
-    let app = AppState::new(rx, gap_ms);
-    eframe::run_native("keyd live graph", native_options, Box::new(move |_| Box::new(app)))
+    let app = AppState::new(rx_opt, gap_ms, source);
+    eframe::run_native("mon-key", native_options, Box::new(move |_| Box::new(app)))
         .map_err(|e| anyhow!("eframe error: {e}"))
 }
