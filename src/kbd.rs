@@ -99,3 +99,52 @@ pub fn collect_devices() -> Vec<DeviceInfo> {
 
     best.into_values().map(|(_, info)| info).collect()
 }
+
+
+
+use crossbeam_channel::{unbounded, Receiver};
+use inotify::{EventMask, Inotify, WatchMask};
+use std::thread;
+
+
+/// Spawn an inotify watcher on /dev/input to auto-refresh device list on add/remove.
+/// Linux-only. Non-intrusive: users don't need read perms on the event nodes for this.
+pub fn spawn_input_dir_watcher() -> Receiver<()> {
+    let (tx, rx) = unbounded();
+
+
+    thread::spawn(move || {
+        let mut ino = match Inotify::init() {
+            Ok(i) => i,
+            Err(_) => return,
+        };
+        // Watch create/delete/move events; devices often appear as MOVED_TO
+        let mask = WatchMask::CREATE | WatchMask::DELETE | WatchMask::MOVED_TO | WatchMask::MOVED_FROM;
+        if ino.watches().add("/dev/input", mask).is_err() {
+            return;
+        }
+
+
+        let mut buf = [0u8; 4096];
+        loop {
+            let Ok(events) = ino.read_events_blocking(&mut buf) else { break };
+            let mut changed = false;
+            for ev in events {
+                // Only react to event* nodes
+                if let Some(name) = ev.name {
+                    if name.to_string_lossy().starts_with("event")
+                        && ev.mask.intersects(EventMask::CREATE | EventMask::DELETE | EventMask::MOVED_TO | EventMask::MOVED_FROM)
+                    {
+                        changed = true;
+                    }
+                }
+            }
+            if changed {
+                let _ = tx.send(());
+            }
+        }
+    });
+
+
+    rx
+}

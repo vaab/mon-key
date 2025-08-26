@@ -1,5 +1,5 @@
 use anyhow::{anyhow, Result};
-use crossbeam_channel::Receiver;
+use crossbeam_channel::{Receiver,TryRecvError};
 use eframe::{egui, egui::{Align2, Color32, FontId, Pos2, Rect, Rounding, Stroke, Key, CursorIcon}};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -160,6 +160,7 @@ struct AppState {
     devices: Vec<evdev_reader::DeviceInfo>,
     selected_dev_idx: Option<usize>,
     source: InputSource,
+    devwatch_rx: Option<crossbeam_channel::Receiver<()>>,
 }
 
 impl AppState {
@@ -183,6 +184,7 @@ impl AppState {
             devices: Vec::new(),
             selected_dev_idx: None,
             source,
+            devwatch_rx: Some(kbd::spawn_input_dir_watcher()),
         };
         // Pre-populate device list so the picker isn't empty on first open
         s.refresh_devices();
@@ -207,6 +209,19 @@ impl AppState {
         // restore selection if the same device still exists
         self.selected_dev_idx = selected_path
             .and_then(|p| self.devices.iter().position(|d| d.path == p));
+
+        // If previously selected device is gone, drop rx and stop listening
+        if self.selected_dev_idx.is_none() {
+            if self.selected_dev_idx.is_none() {
+                // destructure unconditionally (no warning)
+                let InputSource::Evdev(ref mut p) = self.source;
+                if !p.as_os_str().is_empty() {
+                    self.rx = None;
+                    self.listening = false;
+                    *p = PathBuf::new();
+                }
+            }
+        }
     }
     fn set_evdev_source(&mut self, idx: usize) {
         if idx >= self.devices.len() { return; }
@@ -224,41 +239,46 @@ impl AppState {
 
     fn ingest(&mut self) {
         let Some(rx) = &self.rx else { return; };
-        while let Ok(ev) = rx.try_recv() {
-            if !self.listening || self.ui_edit_active {
-                continue;
-            }
-            // Don't start a recording on stray 'Up' events (e.g., Enter release)
-            if self.cur.is_none() && matches!(ev.kind, Kind::Up) {
-                continue;
-            }
-            match &mut self.cur {
-                None => {
-                    let mut s = Sequence::new();
-                    s.uid = self.next_uid;
-                    self.next_uid += 1;
-                    s.now_ms = 0;
-                    match ev.kind {
-                        Kind::Down => s.on_down(&ev.key),
-                        Kind::Up => s.on_up(&ev.key),
+        loop {
+            match rx.try_recv() {
+                Ok(ev) => {
+                    if !self.listening || self.ui_edit_active {
+                        continue;
                     }
-                    // When a new recording starts, focus/select it & ensure it scrolls into view
-                    self.selected_uid = Some(s.uid);
-                    self.scroll_selected_into_view = true;
-                    self.cur = Some(s);
-                }
-                Some(s) => {
-                    s.now_ms = s.now_ms.saturating_add(ev.delta_ms);
-                    match ev.kind {
-                        Kind::Down => s.on_down(&ev.key),
-                        Kind::Up => s.on_up(&ev.key),
+                    // (unchanged) ignore leading Up, create/extend cur, update now_ms, etc.
+                    if self.cur.is_none() && matches!(ev.kind, Kind::Up) {
+                        continue;
                     }
+                    match &mut self.cur {
+                        None => {
+                            let mut s = Sequence::new();
+                            s.uid = self.next_uid;
+                            self.next_uid += 1;
+                            s.now_ms = 0;
+                            match ev.kind { Kind::Down => s.on_down(&ev.key), Kind::Up => s.on_up(&ev.key) }
+                            self.selected_uid = Some(s.uid);
+                            self.scroll_selected_into_view = true;
+                            self.cur = Some(s);
+                        }
+                        Some(s) => {
+                            s.now_ms = s.now_ms.saturating_add(ev.delta_ms);
+                            match ev.kind { Kind::Down => s.on_down(&ev.key), Kind::Up => s.on_up(&ev.key) }
+                        }
+                    }
+                    self.last_event = Some(Instant::now());
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    // Device reader died (likely device removed). Stop listening and clear rx.
+                    self.rx = None;
+                    self.listening = false;
+                    // Optional: close any live sequence immediately (else idle finalization will do it)
+                    self.force_finalize_now();
+                    break;
                 }
             }
-            self.last_event = Some(Instant::now());
         }
     }
-
     fn force_finalize_now(&mut self) {
         if let Some(mut s) = self.cur.take() {
             // Compute visual elapsed since last event, but keep recorded times
@@ -734,6 +754,12 @@ fn draw_sequence_block(
 // ===== eframe::App =====
 impl eframe::App for AppState {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
+        if let Some(rx) = &self.devwatch_rx {
+            let mut changed = false;
+            while rx.try_recv().is_ok() { changed = true; }
+            if changed { self.refresh_devices(); }
+        }
         // If no device is selected/bound, force listening off
         if self.rx.is_none() && self.listening {
             self.listening = false;
@@ -880,11 +906,6 @@ impl eframe::App for AppState {
                             ui.close_menu();
                         }
                     });
-
-                // keep the explicit refresh button:
-                if ui.button("↻").on_hover_text("Refresh devices").clicked() {
-                    self.refresh_devices();
-                }
 
                 if self.rx.is_some() {
                     // Indicator at far right: cross-faded red dot ↔ listening ring
